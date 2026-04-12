@@ -15,6 +15,8 @@ namespace app {
 class IntrusionMonitorTask : public task::WhoTask {
 public:
     static inline constexpr EventBits_t NEW_FRAME = frame_cap::WhoFrameCapNode::NEW_FRAME;
+    static inline constexpr uint16_t DETECT_WIDTH = 128;
+    static inline constexpr uint16_t DETECT_HEIGHT = 75;
 
     IntrusionMonitorTask(const std::string &name, frame_cap::WhoFrameCapNode *frame_cap_node);
     ~IntrusionMonitorTask();
@@ -54,6 +56,7 @@ public:
 private:
     void lcd_disp_cb(who::cam::cam_fb_t *fb);
     void draw_overlay(who::cam::cam_fb_t *fb, bool intrusion, uint16_t border_width);
+    uint16_t scale_border_width(uint16_t display_w, uint16_t display_h, uint16_t detect_border_width) const;
 
     frame_cap::WhoFrameCap *m_frame_cap;
     lcd_disp::WhoFrameLCDDisp *m_lcd_disp;

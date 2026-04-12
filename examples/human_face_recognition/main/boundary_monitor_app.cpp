@@ -190,7 +190,8 @@ bool IntrusionMonitorTask::init_detector_if_needed(who::cam::cam_fb_t *fb)
         return true;
     }
 
-    m_pixels = static_cast<size_t>(fb->width) * static_cast<size_t>(fb->height);
+    (void)fb;
+    m_pixels = static_cast<size_t>(DETECT_WIDTH) * static_cast<size_t>(DETECT_HEIGHT);
     m_gray_frame = static_cast<uint8_t *>(heap_caps_malloc(m_pixels, MALLOC_CAP_DEFAULT));
     m_bootstrap_frames = static_cast<uint8_t **>(calloc(kBootstrapFrames, sizeof(uint8_t *)));
     if (!m_gray_frame || !m_bootstrap_frames) {
@@ -208,7 +209,7 @@ bool IntrusionMonitorTask::init_detector_if_needed(who::cam::cam_fb_t *fb)
         }
     }
 
-    intrusion_detector_default_config(&m_cfg, fb->width, fb->height);
+    intrusion_detector_default_config(&m_cfg, DETECT_WIDTH, DETECT_HEIGHT);
     m_cfg.bg_method = ID_BG_KNN_STANDARD;
     m_cfg.consecutive_trigger_frames = 3;
     m_cfg.alarm_hold_frames = 10;
@@ -228,8 +229,8 @@ bool IntrusionMonitorTask::convert_to_gray(who::cam::cam_fb_t *fb)
 {
     dl::image::img_t gray = {
         .data = m_gray_frame,
-        .width = fb->width,
-        .height = fb->height,
+        .width = DETECT_WIDTH,
+        .height = DETECT_HEIGHT,
         .pix_type = dl::image::DL_IMAGE_PIX_TYPE_GRAY,
     };
     return m_image_transformer.set_src_img(*fb).set_dst_img(gray).transform() == ESP_OK;
@@ -250,7 +251,7 @@ uint16_t IntrusionMonitorTask::calc_border_width(const intrusion_detector_config
 
 BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) :
     m_frame_cap(frame_cap),
-    m_lcd_disp(new lcd_disp::WhoFrameLCDDisp("LCDDisp", frame_cap->get_last_node(), 1)),
+    m_lcd_disp(new lcd_disp::WhoFrameLCDDisp("LCDDisp", frame_cap->get_last_node(), 0)),
     m_monitor_task(new IntrusionMonitorTask("BoundaryDetect", frame_cap->get_last_node()))
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     ,
@@ -328,6 +329,7 @@ void BoundaryMonitorAppLCD::lcd_disp_cb(who::cam::cam_fb_t *fb)
 
 void BoundaryMonitorAppLCD::draw_overlay(who::cam::cam_fb_t *fb, bool intrusion, uint16_t border_width)
 {
+    border_width = scale_border_width(fb->width, fb->height, border_width);
     if (border_width == 0 || border_width * 2 >= fb->width || border_width * 2 >= fb->height) {
         return;
     }
@@ -344,6 +346,23 @@ void BoundaryMonitorAppLCD::draw_overlay(who::cam::cam_fb_t *fb, bool intrusion,
 #else
     draw_boundary_on_canvas(m_lcd_disp->get_canvas(), fb->width, fb->height, border_width, intrusion);
 #endif
+}
+
+uint16_t BoundaryMonitorAppLCD::scale_border_width(
+    uint16_t display_w,
+    uint16_t display_h,
+    uint16_t detect_border_width
+) const
+{
+    uint32_t scaled_x =
+        static_cast<uint32_t>(detect_border_width) * display_w / IntrusionMonitorTask::DETECT_WIDTH;
+    uint32_t scaled_y =
+        static_cast<uint32_t>(detect_border_width) * display_h / IntrusionMonitorTask::DETECT_HEIGHT;
+    uint32_t scaled = scaled_x < scaled_y ? scaled_x : scaled_y;
+    if (scaled == 0u) {
+        scaled = 1u;
+    }
+    return static_cast<uint16_t>(scaled);
 }
 
 } // namespace app
