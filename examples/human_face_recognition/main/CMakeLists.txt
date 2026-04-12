@@ -1,11 +1,18 @@
-set(src_dirs        ./)
+set(srcs            ./app_main.cpp
+                    ./frame_cap_pipeline.cpp
+                    ./boundary_monitor_app.cpp
+                    ../cv_test/c_port/intrusion_detector.c)
 
-set(include_dirs    ./)
+set(include_dirs    ./
+                    ../cv_test/c_port)
 
 set(requires who_spiflash_fatfs
-             who_recognition_app)
+             who_task
+             who_frame_cap
+             who_frame_lcd_disp
+             who_lcd)
 
-idf_component_register(SRC_DIRS ${src_dirs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
+idf_component_register(SRCS ${srcs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
 
 
 

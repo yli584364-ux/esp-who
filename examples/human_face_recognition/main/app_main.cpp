@@ -1,6 +1,5 @@
 #include "frame_cap_pipeline.hpp"
-#include "who_recognition_app_lcd.hpp"
-#include "who_recognition_app_term.hpp"
+#include "boundary_monitor_app.hpp"
 #include "who_spiflash_fatfs.hpp"
 
 using namespace who::frame_cap;
@@ -30,8 +29,6 @@ extern "C" void app_main(void)
     auto frame_cap = get_mipi_csi_frame_cap_pipeline();
     // auto frame_cap = get_uvc_frame_cap_pipeline();
 #endif
-    auto recognition_app = new WhoRecognitionAppLCD(frame_cap);
-    // try this if you don't have a lcd.
-    // auto recognition_app = new WhoRecognitionAppTerm(frame_cap);
-    recognition_app->run();
+    auto boundary_app = new BoundaryMonitorAppLCD(frame_cap);
+    boundary_app->run();
 }
