@@ -20,6 +20,24 @@ static constexpr uint16_t kPreviewScalePercent = 78;
 static const std::vector<uint8_t> kNormalColor = {0, 255, 0};
 static const std::vector<uint8_t> kAlertColor = {255, 0, 0};
 
+void resize_rgb565_nearest(
+    const uint16_t *src,
+    uint16_t src_w,
+    uint16_t src_h,
+    uint16_t *dst,
+    uint16_t dst_w,
+    uint16_t dst_h
+)
+{
+    for (uint16_t y = 0; y < dst_h; ++y) {
+        uint16_t sy = static_cast<uint16_t>((static_cast<uint32_t>(y) * src_h) / dst_h);
+        for (uint16_t x = 0; x < dst_w; ++x) {
+            uint16_t sx = static_cast<uint16_t>((static_cast<uint32_t>(x) * src_w) / dst_w);
+            dst[static_cast<size_t>(y) * dst_w + x] = src[static_cast<size_t>(sy) * src_w + sx];
+        }
+    }
+}
+
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
 lv_color_t get_lv_color(bool intrusion)
 {
@@ -309,7 +327,6 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
     m_preview_buf(nullptr),
     m_preview_w(0),
     m_preview_h(0),
-    m_preview_caps(0),
     m_preview_ready(false),
     m_detection_enabled(false)
 #endif
@@ -317,11 +334,6 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
     m_lcd_disp->set_lcd_disp_cb(std::bind(&BoundaryMonitorAppLCD::lcd_disp_cb, this, std::placeholders::_1));
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
-#if CONFIG_IDF_TARGET_ESP32S3
-    m_preview_caps = dl::image::DL_IMAGE_CAP_RGB565_BIG_ENDIAN;
-#endif
-    m_preview_transformer.set_caps(m_preview_caps);
-
     bsp_display_lock(0);
     m_label = create_lvgl_label("Waiting: press Start Detect", LV_FONT_DEFAULT, {255, 255, 255});
     lv_obj_align(m_label, LV_ALIGN_TOP_LEFT, 8, 8);
@@ -411,14 +423,14 @@ void BoundaryMonitorAppLCD::lcd_disp_cb(who::cam::cam_fb_t *fb)
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     if (m_preview_ready) {
-        dl::image::img_t src = *fb;
-        dl::image::img_t dst = {
-            .data = m_preview_buf,
-            .width = m_preview_w,
-            .height = m_preview_h,
-            .pix_type = src.pix_type,
-        };
-        if (m_preview_transformer.set_src_img(src).set_dst_img(dst).transform() == ESP_OK) {
+        if (fb->format == who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB565) {
+            resize_rgb565_nearest(
+                static_cast<const uint16_t *>(fb->buf),
+                fb->width,
+                fb->height,
+                reinterpret_cast<uint16_t *>(m_preview_buf),
+                m_preview_w,
+                m_preview_h);
             lv_canvas_set_buffer(
                 m_lcd_disp->get_canvas(), m_preview_buf, m_preview_w, m_preview_h, LV_COLOR_FORMAT_NATIVE);
         }
@@ -563,8 +575,17 @@ void BoundaryMonitorAppLCD::update_start_button_text()
 
 void BoundaryMonitorAppLCD::draw_overlay(who::cam::cam_fb_t *fb, bool intrusion, uint16_t border_width)
 {
-    border_width = scale_border_width(fb->width, fb->height, border_width);
-    if (border_width == 0 || border_width * 2 >= fb->width || border_width * 2 >= fb->height) {
+    uint16_t draw_w = fb->width;
+    uint16_t draw_h = fb->height;
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (m_preview_ready) {
+        draw_w = m_preview_w;
+        draw_h = m_preview_h;
+    }
+#endif
+
+    border_width = scale_border_width(draw_w, draw_h, border_width);
+    if (border_width == 0 || border_width * 2 >= draw_w || border_width * 2 >= draw_h) {
         return;
     }
 
@@ -573,12 +594,12 @@ void BoundaryMonitorAppLCD::draw_overlay(who::cam::cam_fb_t *fb, bool intrusion,
     dl::image::draw_hollow_rectangle(*fb,
                                      border_width,
                                      border_width,
-                                     fb->width - border_width - 1,
-                                     fb->height - border_width - 1,
+                                     draw_w - border_width - 1,
+                                     draw_h - border_width - 1,
                                      color,
                                      intrusion ? 4 : 2);
 #else
-    draw_boundary_on_canvas(m_lcd_disp->get_canvas(), fb->width, fb->height, border_width, intrusion);
+    draw_boundary_on_canvas(m_lcd_disp->get_canvas(), draw_w, draw_h, border_width, intrusion);
 #endif
 }
 

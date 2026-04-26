@@ -84,10 +84,8 @@ private:
     uint8_t *m_preview_buf;
     uint16_t m_preview_w;
     uint16_t m_preview_h;
-    uint32_t m_preview_caps;
     bool m_preview_ready;
     bool m_detection_enabled;
-    dl::image::ImageTransformer m_preview_transformer;
 #endif
 };
 
