@@ -11,10 +11,14 @@ set(EXTRA_COMPONENT_DIRS ../../components/who_task
                          ../../components/who_frame_lcd_disp
                          ../../components/who_detect
                          ../../components/who_recognition
-                         ../../components/who_app/who_recognition_app)
+                         ../../components/who_app/who_recognition_app
+                         ./hand_detect)
 
 add_compile_options(-fdiagnostics-color=always)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+if (NOT DEFINED BSP AND IDF_TARGET STREQUAL "esp32p4")
+    set(BSP esp32_p4_function_ev_board)
+endif()
 if (NOT DEFINED BSP)
     message(FATAL_ERROR "BSP is not defined, please make sure that the environment variable IDF_EXTRA_ACTIONS_PATH is properly set.")
 endif()

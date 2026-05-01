@@ -31,6 +31,48 @@ static void id_build_border_mask(intrusion_detector_t *detector) {
     const uint16_t bw = id_border_width(detector);
 
     memset(detector->border_mask, 0, id_pixel_count(detector));
+    if (detector->cfg.custom_border_enabled) {
+        uint16_t x1 = detector->cfg.custom_x1;
+        uint16_t y1 = detector->cfg.custom_y1;
+        uint16_t x2 = detector->cfg.custom_x2;
+        uint16_t y2 = detector->cfg.custom_y2;
+
+        if (x1 > x2) {
+            uint16_t t = x1;
+            x1 = x2;
+            x2 = t;
+        }
+        if (y1 > y2) {
+            uint16_t t = y1;
+            y1 = y2;
+            y2 = t;
+        }
+
+        if (x2 >= width) {
+            x2 = width > 0u ? (uint16_t)(width - 1u) : 0u;
+        }
+        if (y2 >= height) {
+            y2 = height > 0u ? (uint16_t)(height - 1u) : 0u;
+        }
+        if (x1 >= width) {
+            x1 = width > 0u ? (uint16_t)(width - 1u) : 0u;
+        }
+        if (y1 >= height) {
+            y1 = height > 0u ? (uint16_t)(height - 1u) : 0u;
+        }
+
+        if (x2 > x1 && y2 > y1) {
+            for (uint16_t y = y1; y <= y2; ++y) {
+                for (uint16_t x = x1; x <= x2; ++x) {
+                    bool on_border = ((uint16_t)(x - x1) < bw) || ((uint16_t)(x2 - x) < bw) ||
+                                     ((uint16_t)(y - y1) < bw) || ((uint16_t)(y2 - y) < bw);
+                    detector->border_mask[(size_t)y * width + x] = on_border ? 1u : 0u;
+                }
+            }
+            return;
+        }
+    }
+
     for (uint16_t y = 0; y < height; ++y) {
         for (uint16_t x = 0; x < width; ++x) {
             bool on_border = (x < bw) || (x >= width - bw) || (y < bw) || (y >= height - bw);
@@ -321,6 +363,11 @@ void intrusion_detector_default_config(intrusion_detector_config_t *cfg, uint16_
     cfg->mog2_std_init = 12u;
     cfg->mog2_std_min = 4u;
     cfg->mog2_threshold_scale = 3u;
+    cfg->custom_border_enabled = false;
+    cfg->custom_x1 = 0u;
+    cfg->custom_y1 = 0u;
+    cfg->custom_x2 = 0u;
+    cfg->custom_y2 = 0u;
 }
 
 bool intrusion_detector_init(intrusion_detector_t *detector, const intrusion_detector_config_t *cfg) {
@@ -373,12 +420,30 @@ void intrusion_detector_deinit(intrusion_detector_t *detector) {
 }
 
 void intrusion_detector_reset(intrusion_detector_t *detector) {
+    id_build_border_mask(detector);
     if (detector->cfg.bg_method == ID_BG_MOG2_STABLE) {
         memset(detector->bg_mean, 0, id_pixel_count(detector));
         memset(detector->bg_dev, 0, id_pixel_count(detector));
     } else {
         memset(detector->knn_samples, 0, (size_t)detector->cfg.knn_sample_count * id_pixel_count(detector));
     }
+    id_reset_history(detector);
+}
+
+void intrusion_detector_set_custom_border_rect(
+    intrusion_detector_t *detector,
+    bool enabled,
+    uint16_t x1,
+    uint16_t y1,
+    uint16_t x2,
+    uint16_t y2
+) {
+    detector->cfg.custom_border_enabled = enabled;
+    detector->cfg.custom_x1 = x1;
+    detector->cfg.custom_y1 = y1;
+    detector->cfg.custom_x2 = x2;
+    detector->cfg.custom_y2 = y2;
+    id_build_border_mask(detector);
     id_reset_history(detector);
 }
 

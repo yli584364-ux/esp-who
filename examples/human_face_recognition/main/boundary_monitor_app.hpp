@@ -6,6 +6,7 @@
 #include "who_frame_cap.hpp"
 #include "who_frame_lcd_disp.hpp"
 #include "who_task.hpp"
+#include "hand_detect.hpp"
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
 #include "lvgl.h"
@@ -25,6 +26,7 @@ public:
 
     bool get_result(intrusion_detector_result_t *result, bool *ready, size_t *bootstrap_count, uint16_t *border_width);
     void request_reset();
+    void request_custom_boundary(bool enabled, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
 
 private:
     void task() override;
@@ -48,6 +50,14 @@ private:
     uint16_t m_border_width;
     uint32_t m_caps;
     std::atomic<bool> m_reset_requested;
+    std::atomic<bool> m_custom_boundary_update_pending;
+    std::atomic<bool> m_custom_boundary_enable_pending;
+    std::atomic<uint32_t> m_custom_boundary_rect_pending;
+    bool m_custom_boundary_enabled;
+    uint16_t m_custom_x1;
+    uint16_t m_custom_y1;
+    uint16_t m_custom_x2;
+    uint16_t m_custom_y2;
     uint16_t m_consecutive_failures;
 };
 
@@ -61,7 +71,8 @@ public:
 private:
     static void reset_button_event_cb(lv_event_t *e);
     static void start_button_event_cb(lv_event_t *e);
-    static void placeholder_button_event_cb(lv_event_t *e);
+    static void feature2_button_event_cb(lv_event_t *e);
+    static void preview_click_event_cb(lv_event_t *e);
     void lcd_disp_cb(who::cam::cam_fb_t *fb);
     void draw_overlay(who::cam::cam_fb_t *fb, bool intrusion, uint16_t border_width);
     uint16_t scale_border_width(uint16_t display_w, uint16_t display_h, uint16_t detect_border_width) const;
@@ -69,10 +80,14 @@ private:
     void ensure_preview_layout(who::cam::cam_fb_t *fb);
     void set_detection_enabled(bool enabled);
     void update_start_button_text();
+    void handle_feature2_action();
+    void handle_preview_click();
+    void apply_custom_boundary();
 
     frame_cap::WhoFrameCap *m_frame_cap;
     lcd_disp::WhoFrameLCDDisp *m_lcd_disp;
     IntrusionMonitorTask *m_monitor_task;
+    HandDetect *m_hand_detect;
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     lv_obj_t *m_label;
@@ -86,6 +101,11 @@ private:
     uint16_t m_preview_h;
     bool m_preview_ready;
     bool m_detection_enabled;
+    bool m_boundary_edit_mode;
+    bool m_boundary_has_first_point;
+    bool m_boundary_enabled;
+    lv_point_t m_boundary_p1;
+    lv_point_t m_boundary_p2;
 #endif
 };
 

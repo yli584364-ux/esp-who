@@ -35,6 +35,11 @@ typedef struct {
     uint8_t mog2_std_init;
     uint8_t mog2_std_min;
     uint8_t mog2_threshold_scale;
+    bool custom_border_enabled;
+    uint16_t custom_x1;
+    uint16_t custom_y1;
+    uint16_t custom_x2;
+    uint16_t custom_y2;
 } intrusion_detector_config_t;
 
 typedef struct {
@@ -72,6 +77,14 @@ void intrusion_detector_default_config(intrusion_detector_config_t *cfg, uint16_
 bool intrusion_detector_init(intrusion_detector_t *detector, const intrusion_detector_config_t *cfg);
 void intrusion_detector_deinit(intrusion_detector_t *detector);
 void intrusion_detector_reset(intrusion_detector_t *detector);
+void intrusion_detector_set_custom_border_rect(
+    intrusion_detector_t *detector,
+    bool enabled,
+    uint16_t x1,
+    uint16_t y1,
+    uint16_t x2,
+    uint16_t y2
+);
 bool intrusion_detector_bootstrap(intrusion_detector_t *detector, const uint8_t *const *frames, size_t frame_count);
 bool intrusion_detector_process(
     intrusion_detector_t *detector,

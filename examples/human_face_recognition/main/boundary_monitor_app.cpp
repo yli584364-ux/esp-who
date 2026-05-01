@@ -17,6 +17,7 @@ static constexpr size_t kBootstrapFrames = 8;
 static constexpr uint16_t kMaxConsecutiveFailures = 8;
 static constexpr const char *TAG = "BoundaryMonitor";
 static constexpr uint16_t kPreviewScalePercent = 78;
+static constexpr uint16_t kMinCustomBoundarySpan = 8;
 static const std::vector<uint8_t> kNormalColor = {0, 255, 0};
 static const std::vector<uint8_t> kAlertColor = {255, 0, 0};
 
@@ -42,6 +43,26 @@ void resize_rgb565_nearest(
 lv_color_t get_lv_color(bool intrusion)
 {
     return who::cvt_to_lv_color(intrusion ? kAlertColor : kNormalColor);
+}
+
+void draw_custom_boundary_on_canvas(lv_obj_t *canvas, lv_point_t p1, lv_point_t p2, bool intrusion)
+{
+    int32_t x1 = p1.x < p2.x ? p1.x : p2.x;
+    int32_t x2 = p1.x < p2.x ? p2.x : p1.x;
+    int32_t y1 = p1.y < p2.y ? p1.y : p2.y;
+    int32_t y2 = p1.y < p2.y ? p2.y : p1.y;
+
+    lv_draw_rect_dsc_t rect_dsc;
+    lv_draw_rect_dsc_init(&rect_dsc);
+    rect_dsc.bg_opa = LV_OPA_TRANSP;
+    rect_dsc.border_width = intrusion ? 4 : 2;
+    rect_dsc.border_color = intrusion ? get_lv_color(true) : lv_color_hex(0x4FC3F7);
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(canvas, &layer);
+    lv_area_t area = {x1, y1, x2, y2};
+    lv_draw_rect(&layer, &rect_dsc, &area);
+    lv_canvas_finish_layer(canvas, &layer);
 }
 
 void draw_boundary_on_canvas(lv_obj_t *canvas, uint16_t width, uint16_t height, uint16_t border_width, bool intrusion)
@@ -95,6 +116,14 @@ IntrusionMonitorTask::IntrusionMonitorTask(const std::string &name, frame_cap::W
     m_border_width(0),
     m_caps(0),
     m_reset_requested(false),
+    m_custom_boundary_update_pending(false),
+    m_custom_boundary_enable_pending(false),
+    m_custom_boundary_rect_pending(0),
+    m_custom_boundary_enabled(false),
+    m_custom_x1(0),
+    m_custom_y1(0),
+    m_custom_x2(0),
+    m_custom_y2(0),
     m_consecutive_failures(0)
 {
     memset(&m_detector, 0, sizeof(m_detector));
@@ -141,6 +170,15 @@ void IntrusionMonitorTask::request_reset()
     m_reset_requested.store(true);
 }
 
+void IntrusionMonitorTask::request_custom_boundary(bool enabled, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
+{
+    uint32_t packed = (static_cast<uint32_t>(x1) << 24) | (static_cast<uint32_t>(y1) << 16) |
+                      (static_cast<uint32_t>(x2) << 8) | static_cast<uint32_t>(y2);
+    m_custom_boundary_rect_pending.store(packed);
+    m_custom_boundary_enable_pending.store(enabled);
+    m_custom_boundary_update_pending.store(true);
+}
+
 void IntrusionMonitorTask::task()
 {
     while (true) {
@@ -160,6 +198,24 @@ void IntrusionMonitorTask::task()
 
         if (m_reset_requested.exchange(false)) {
             ESP_LOGI(TAG, "manual reset requested, restarting calibration");
+            cleanup();
+            continue;
+        }
+
+        if (m_custom_boundary_update_pending.exchange(false)) {
+            uint32_t packed = m_custom_boundary_rect_pending.load();
+            m_custom_x1 = static_cast<uint16_t>((packed >> 24) & 0xFFu);
+            m_custom_y1 = static_cast<uint16_t>((packed >> 16) & 0xFFu);
+            m_custom_x2 = static_cast<uint16_t>((packed >> 8) & 0xFFu);
+            m_custom_y2 = static_cast<uint16_t>(packed & 0xFFu);
+            m_custom_boundary_enabled = m_custom_boundary_enable_pending.load();
+            ESP_LOGI(TAG,
+                     "custom boundary %s (%u,%u)-(%u,%u)",
+                     m_custom_boundary_enabled ? "enabled" : "disabled",
+                     static_cast<unsigned>(m_custom_x1),
+                     static_cast<unsigned>(m_custom_y1),
+                     static_cast<unsigned>(m_custom_x2),
+                     static_cast<unsigned>(m_custom_y2));
             cleanup();
             continue;
         }
@@ -277,6 +333,11 @@ bool IntrusionMonitorTask::init_detector_if_needed(who::cam::cam_fb_t *fb)
     m_cfg.consecutive_trigger_frames = 3;
     m_cfg.alarm_hold_frames = 10;
     m_cfg.temporal_window = 2;
+    m_cfg.custom_border_enabled = m_custom_boundary_enabled;
+    m_cfg.custom_x1 = m_custom_x1;
+    m_cfg.custom_y1 = m_custom_y1;
+    m_cfg.custom_x2 = m_custom_x2;
+    m_cfg.custom_y2 = m_custom_y2;
     m_border_width = calc_border_width(m_cfg);
 
     if (!intrusion_detector_init(&m_detector, &m_cfg)) {
@@ -315,7 +376,8 @@ uint16_t IntrusionMonitorTask::calc_border_width(const intrusion_detector_config
 BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) :
     m_frame_cap(frame_cap),
     m_lcd_disp(new lcd_disp::WhoFrameLCDDisp("LCDDisp", frame_cap->get_last_node(), 0)),
-    m_monitor_task(new IntrusionMonitorTask("BoundaryDetect", frame_cap->get_last_node()))
+    m_monitor_task(new IntrusionMonitorTask("BoundaryDetect", frame_cap->get_last_node())),
+    m_hand_detect(nullptr)
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     ,
     m_label(nullptr),
@@ -328,11 +390,19 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
     m_preview_w(0),
     m_preview_h(0),
     m_preview_ready(false),
-    m_detection_enabled(false)
+    m_detection_enabled(false),
+    m_boundary_edit_mode(false),
+    m_boundary_has_first_point(false),
+    m_boundary_enabled(false),
+    m_boundary_p1({0, 0}),
+    m_boundary_p2({0, 0})
 #endif
 {
     m_lcd_disp->set_lcd_disp_cb(std::bind(&BoundaryMonitorAppLCD::lcd_disp_cb, this, std::placeholders::_1));
-
+#if 1
+    // instantiate hand detector (load model now)
+    m_hand_detect = new HandDetect(static_cast<HandDetect::model_type_t>(0), false);
+#endif
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     bsp_display_lock(0);
     m_label = create_lvgl_label("Waiting: press Start Detect", LV_FONT_DEFAULT, {255, 255, 255});
@@ -362,9 +432,9 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
     m_start_btn = create_action_button(button_col, "Start Detect", BoundaryMonitorAppLCD::start_button_event_cb, this);
     m_reset_btn = create_action_button(button_col, "Reset Range", BoundaryMonitorAppLCD::reset_button_event_cb, this);
     m_placeholder_btn_1 =
-        create_action_button(button_col, "Feature 2 (Todo)", BoundaryMonitorAppLCD::placeholder_button_event_cb, this);
+        create_action_button(button_col, "Feature 2: Boundary", BoundaryMonitorAppLCD::feature2_button_event_cb, this);
     m_placeholder_btn_2 =
-        create_action_button(button_col, "Feature 3 (Todo)", BoundaryMonitorAppLCD::placeholder_button_event_cb, this);
+        create_action_button(button_col, "Feature 3 (Todo)", BoundaryMonitorAppLCD::feature2_button_event_cb, this);
 
     update_start_button_text();
     bsp_display_unlock();
@@ -398,6 +468,10 @@ BoundaryMonitorAppLCD::~BoundaryMonitorAppLCD()
     }
 #endif
     delete m_monitor_task;
+    if (m_hand_detect) {
+        delete m_hand_detect;
+        m_hand_detect = nullptr;
+    }
     delete m_lcd_disp;
 }
 
@@ -446,6 +520,60 @@ void BoundaryMonitorAppLCD::lcd_disp_cb(who::cam::cam_fb_t *fb)
     bool intrusion = ready && result.intrusion;
     draw_overlay(fb, intrusion, border_width);
 
+    // Run hand detection and draw boxes when enabled
+    uint16_t _draw_w = fb->width;
+    uint16_t _draw_h = fb->height;
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (m_preview_ready) {
+        _draw_w = m_preview_w;
+        _draw_h = m_preview_h;
+    }
+#endif
+
+    if (m_detection_enabled && m_hand_detect && fb) {
+        dl::image::img_t img = {.data = fb->buf, .width = fb->width, .height = fb->height, .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565};
+        std::list<dl::detect::result_t> &res = m_hand_detect->run(img);
+        unsigned cnt = 0;
+        for (auto &r : res) {
+            if (r.box.size() < 4) continue;
+            r.limit_box(static_cast<int>(fb->width), static_cast<int>(fb->height));
+            int x1 = r.box[0];
+            int y1 = r.box[1];
+            int x2 = r.box[2];
+            int y2 = r.box[3];
+            int sx1 = static_cast<int>((static_cast<int64_t>(x1) * _draw_w) / fb->width);
+            int sy1 = static_cast<int>((static_cast<int64_t>(y1) * _draw_h) / fb->height);
+            int sx2 = static_cast<int>((static_cast<int64_t>(x2) * _draw_w) / fb->width);
+            int sy2 = static_cast<int>((static_cast<int64_t>(y2) * _draw_h) / fb->height);
+#if BSP_CONFIG_NO_GRAPHIC_LIB
+            dl::image::draw_hollow_rectangle(*fb, sx1, sy1, sx2, sy2, kAlertColor, 2);
+#else
+            lv_draw_rect_dsc_t rect_dsc;
+            lv_draw_rect_dsc_init(&rect_dsc);
+            rect_dsc.bg_opa = LV_OPA_TRANSP;
+            rect_dsc.border_width = 2;
+            rect_dsc.border_color = get_lv_color(true);
+            lv_layer_t layer;
+            lv_canvas_init_layer(m_lcd_disp->get_canvas(), &layer);
+            lv_area_t area = {sx1, sy1, sx2, sy2};
+            lv_draw_rect(&layer, &rect_dsc, &area);
+            lv_canvas_finish_layer(m_lcd_disp->get_canvas(), &layer);
+#endif
+            cnt++;
+        }
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+        if (m_label) {
+            if (!ready) {
+                lv_label_set_text_fmt(m_label, "Calibrating %u/%u", static_cast<unsigned>(bootstrap_count), kBootstrapFrames);
+            } else {
+                lv_label_set_text_fmt(m_label, "Hands: %u", cnt);
+            }
+        }
+#else
+        ESP_LOGI(TAG, "Hands: %u", cnt);
+#endif
+    }
+
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     if (!m_detection_enabled) {
         lv_label_set_text(m_label, "Camera paused. Press Start Detect.");
@@ -488,11 +616,19 @@ void BoundaryMonitorAppLCD::start_button_event_cb(lv_event_t *e)
     }
 }
 
-void BoundaryMonitorAppLCD::placeholder_button_event_cb(lv_event_t *e)
+void BoundaryMonitorAppLCD::feature2_button_event_cb(lv_event_t *e)
 {
     auto *self = static_cast<BoundaryMonitorAppLCD *>(lv_event_get_user_data(e));
-    if (self && self->m_label) {
-        lv_label_set_text(self->m_label, "Feature TODO: waiting for requirement details");
+    if (self) {
+        self->handle_feature2_action();
+    }
+}
+
+void BoundaryMonitorAppLCD::preview_click_event_cb(lv_event_t *e)
+{
+    auto *self = static_cast<BoundaryMonitorAppLCD *>(lv_event_get_user_data(e));
+    if (self) {
+        self->handle_preview_click();
     }
 }
 
@@ -531,8 +667,124 @@ void BoundaryMonitorAppLCD::ensure_preview_layout(who::cam::cam_fb_t *fb)
     lv_obj_t *canvas = m_lcd_disp->get_canvas();
     lv_obj_set_size(canvas, m_preview_w, m_preview_h);
     lv_obj_align(canvas, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(canvas, BoundaryMonitorAppLCD::preview_click_event_cb, LV_EVENT_CLICKED, this);
 
     m_preview_ready = true;
+#endif
+}
+
+void BoundaryMonitorAppLCD::handle_feature2_action()
+{
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (m_boundary_edit_mode) {
+        m_boundary_edit_mode = false;
+        m_boundary_has_first_point = false;
+        if (m_label) {
+            lv_label_set_text(m_label, "Boundary edit canceled");
+        }
+        return;
+    }
+
+    if (m_boundary_enabled) {
+        m_boundary_enabled = false;
+        m_monitor_task->request_custom_boundary(false, 0, 0, 0, 0);
+        if (m_label) {
+            lv_label_set_text(m_label, "Custom boundary disabled");
+        }
+        return;
+    }
+
+    m_boundary_edit_mode = true;
+    m_boundary_has_first_point = false;
+    if (m_label) {
+        lv_label_set_text(m_label, "Boundary edit: tap top-left then bottom-right");
+    }
+#endif
+}
+
+void BoundaryMonitorAppLCD::handle_preview_click()
+{
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (!m_boundary_edit_mode || !m_preview_ready) {
+        return;
+    }
+
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev) {
+        return;
+    }
+
+    lv_point_t p = {0, 0};
+    lv_indev_get_point(indev, &p);
+    lv_area_t area;
+    lv_obj_get_coords(m_lcd_disp->get_canvas(), &area);
+
+    int32_t lx = p.x - area.x1;
+    int32_t ly = p.y - area.y1;
+    if (lx < 0) {
+        lx = 0;
+    }
+    if (ly < 0) {
+        ly = 0;
+    }
+    if (lx >= m_preview_w) {
+        lx = m_preview_w - 1;
+    }
+    if (ly >= m_preview_h) {
+        ly = m_preview_h - 1;
+    }
+
+    if (!m_boundary_has_first_point) {
+        m_boundary_p1 = {static_cast<int16_t>(lx), static_cast<int16_t>(ly)};
+        m_boundary_p2 = m_boundary_p1;
+        m_boundary_has_first_point = true;
+        if (m_label) {
+            lv_label_set_text(m_label, "First point set, tap second point");
+        }
+        return;
+    }
+
+    m_boundary_p2 = {static_cast<int16_t>(lx), static_cast<int16_t>(ly)};
+    m_boundary_has_first_point = false;
+    m_boundary_edit_mode = false;
+    apply_custom_boundary();
+#endif
+}
+
+void BoundaryMonitorAppLCD::apply_custom_boundary()
+{
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    int32_t x1 = m_boundary_p1.x < m_boundary_p2.x ? m_boundary_p1.x : m_boundary_p2.x;
+    int32_t x2 = m_boundary_p1.x < m_boundary_p2.x ? m_boundary_p2.x : m_boundary_p1.x;
+    int32_t y1 = m_boundary_p1.y < m_boundary_p2.y ? m_boundary_p1.y : m_boundary_p2.y;
+    int32_t y2 = m_boundary_p1.y < m_boundary_p2.y ? m_boundary_p2.y : m_boundary_p1.y;
+
+    if ((x2 - x1) < kMinCustomBoundarySpan || (y2 - y1) < kMinCustomBoundarySpan) {
+        if (m_label) {
+            lv_label_set_text(m_label, "Boundary too small, please retry");
+        }
+        m_boundary_enabled = false;
+        return;
+    }
+
+    m_boundary_enabled = true;
+    uint16_t dx1 = static_cast<uint16_t>((static_cast<uint32_t>(x1) * IntrusionMonitorTask::DETECT_WIDTH) / m_preview_w);
+    uint16_t dx2 = static_cast<uint16_t>((static_cast<uint32_t>(x2) * IntrusionMonitorTask::DETECT_WIDTH) / m_preview_w);
+    uint16_t dy1 = static_cast<uint16_t>((static_cast<uint32_t>(y1) * IntrusionMonitorTask::DETECT_HEIGHT) / m_preview_h);
+    uint16_t dy2 = static_cast<uint16_t>((static_cast<uint32_t>(y2) * IntrusionMonitorTask::DETECT_HEIGHT) / m_preview_h);
+
+    if (dx2 >= IntrusionMonitorTask::DETECT_WIDTH) {
+        dx2 = IntrusionMonitorTask::DETECT_WIDTH - 1;
+    }
+    if (dy2 >= IntrusionMonitorTask::DETECT_HEIGHT) {
+        dy2 = IntrusionMonitorTask::DETECT_HEIGHT - 1;
+    }
+
+    m_monitor_task->request_custom_boundary(true, dx1, dy1, dx2, dy2);
+    if (m_label) {
+        lv_label_set_text(m_label, "Custom boundary applied, recalibrating...");
+    }
 #endif
 }
 
@@ -543,16 +795,12 @@ void BoundaryMonitorAppLCD::set_detection_enabled(bool enabled)
     }
 
     if (enabled) {
+        m_monitor_task->request_reset();
+        m_monitor_task->resume();
         for (const auto &frame_cap_node : m_frame_cap->get_all_nodes()) {
             frame_cap_node->resume();
         }
-        m_lcd_disp->resume();
-        m_monitor_task->resume();
     } else {
-        for (const auto &frame_cap_node : m_frame_cap->get_all_nodes()) {
-            frame_cap_node->pause();
-        }
-        m_lcd_disp->pause();
         m_monitor_task->pause();
     }
 
@@ -599,7 +847,11 @@ void BoundaryMonitorAppLCD::draw_overlay(who::cam::cam_fb_t *fb, bool intrusion,
                                      color,
                                      intrusion ? 4 : 2);
 #else
-    draw_boundary_on_canvas(m_lcd_disp->get_canvas(), draw_w, draw_h, border_width, intrusion);
+    if (m_boundary_enabled) {
+        draw_custom_boundary_on_canvas(m_lcd_disp->get_canvas(), m_boundary_p1, m_boundary_p2, intrusion);
+    } else {
+        draw_boundary_on_canvas(m_lcd_disp->get_canvas(), draw_w, draw_h, border_width, intrusion);
+    }
 #endif
 }
 
