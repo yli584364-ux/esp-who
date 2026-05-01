@@ -1,3 +1,4 @@
 dependencies:
   esp32_p4_function_ev_board:
     version: '*'
+  espressif/hand_detect: ^0.1.1

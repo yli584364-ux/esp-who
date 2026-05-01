@@ -41,7 +41,7 @@ inline cam_fb_fmt_t pix_fmt2cam_fb_fmt(pixformat_t pix_fmt)
 inline cam_fb_fmt_t dl_pix_fmt2cam_fb_fmt(dl::image::pix_type_t dl_pix_fmt)
 {
     switch (dl_pix_fmt) {
-    case dl::image::DL_IMAGE_PIX_TYPE_RGB565:
+    case dl::image::DL_IMAGE_PIX_TYPE_RGB565LE:
         return cam_fb_fmt_t::CAM_FB_FMT_RGB565;
     case dl::image::DL_IMAGE_PIX_TYPE_RGB888:
         return cam_fb_fmt_t::CAM_FB_FMT_RGB888;
@@ -112,7 +112,7 @@ typedef struct cam_fb_s {
     cam_fb_s(const dl::image::img_t &img, const struct timeval &time)
     {
         buf = img.data;
-        len = dl::image::get_img_byte_size(img);
+        len = img.width * img.height * dl::image::get_pix_byte_size(img.pix_type);
         width = img.width;
         height = img.height;
         format = dl_pix_fmt2cam_fb_fmt(img.pix_type);
@@ -124,7 +124,7 @@ typedef struct cam_fb_s {
         return {.data = buf,
                 .width = width,
                 .height = height,
-                .pix_type = format == who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB565 ? dl::image::DL_IMAGE_PIX_TYPE_RGB565
+                .pix_type = format == who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB565 ? dl::image::DL_IMAGE_PIX_TYPE_RGB565LE
                                                                                 : dl::image::DL_IMAGE_PIX_TYPE_RGB888};
     }
 } cam_fb_t;

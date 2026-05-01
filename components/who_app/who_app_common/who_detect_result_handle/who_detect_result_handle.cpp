@@ -129,7 +129,7 @@ WhoDetectResultLCDDisp::WhoDetectResultLCDDisp(task::WhoTask *task, const std::v
         dl::image::cvt_pix(m_rgb888_palette[i].data(),
                            m_rgb565_palette[i].data(),
                            dl::image::DL_IMAGE_PIX_TYPE_RGB888,
-                           dl::image::DL_IMAGE_PIX_TYPE_RGB565,
+                           dl::image::DL_IMAGE_PIX_TYPE_RGB565LE,
                            caps);
     }
 }

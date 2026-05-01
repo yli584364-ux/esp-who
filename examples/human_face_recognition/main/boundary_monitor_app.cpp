@@ -132,8 +132,9 @@ IntrusionMonitorTask::IntrusionMonitorTask(const std::string &name, frame_cap::W
 #if CONFIG_IDF_TARGET_ESP32S3
     m_caps = dl::image::DL_IMAGE_CAP_RGB565_BIG_ENDIAN;
 #endif
-    m_image_transformer.set_caps(m_caps);
+    
 }
+
 
 IntrusionMonitorTask::~IntrusionMonitorTask()
 {
@@ -376,8 +377,7 @@ uint16_t IntrusionMonitorTask::calc_border_width(const intrusion_detector_config
 BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) :
     m_frame_cap(frame_cap),
     m_lcd_disp(new lcd_disp::WhoFrameLCDDisp("LCDDisp", frame_cap->get_last_node(), 0)),
-    m_monitor_task(new IntrusionMonitorTask("BoundaryDetect", frame_cap->get_last_node())),
-    m_hand_detect(nullptr)
+    m_monitor_task(new IntrusionMonitorTask("BoundaryDetect", frame_cap->get_last_node()))
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     ,
     m_label(nullptr),
@@ -399,10 +399,7 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
 #endif
 {
     m_lcd_disp->set_lcd_disp_cb(std::bind(&BoundaryMonitorAppLCD::lcd_disp_cb, this, std::placeholders::_1));
-#if 1
-    // instantiate hand detector (load model now)
-    m_hand_detect = new HandDetect(static_cast<HandDetect::model_type_t>(0), false);
-#endif
+
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     bsp_display_lock(0);
     m_label = create_lvgl_label("Waiting: press Start Detect", LV_FONT_DEFAULT, {255, 255, 255});
@@ -468,10 +465,6 @@ BoundaryMonitorAppLCD::~BoundaryMonitorAppLCD()
     }
 #endif
     delete m_monitor_task;
-    if (m_hand_detect) {
-        delete m_hand_detect;
-        m_hand_detect = nullptr;
-    }
     delete m_lcd_disp;
 }
 
@@ -519,60 +512,6 @@ void BoundaryMonitorAppLCD::lcd_disp_cb(who::cam::cam_fb_t *fb)
 
     bool intrusion = ready && result.intrusion;
     draw_overlay(fb, intrusion, border_width);
-
-    // Run hand detection and draw boxes when enabled
-    uint16_t _draw_w = fb->width;
-    uint16_t _draw_h = fb->height;
-#if !BSP_CONFIG_NO_GRAPHIC_LIB
-    if (m_preview_ready) {
-        _draw_w = m_preview_w;
-        _draw_h = m_preview_h;
-    }
-#endif
-
-    if (m_detection_enabled && m_hand_detect && fb) {
-        dl::image::img_t img = {.data = fb->buf, .width = fb->width, .height = fb->height, .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565};
-        std::list<dl::detect::result_t> &res = m_hand_detect->run(img);
-        unsigned cnt = 0;
-        for (auto &r : res) {
-            if (r.box.size() < 4) continue;
-            r.limit_box(static_cast<int>(fb->width), static_cast<int>(fb->height));
-            int x1 = r.box[0];
-            int y1 = r.box[1];
-            int x2 = r.box[2];
-            int y2 = r.box[3];
-            int sx1 = static_cast<int>((static_cast<int64_t>(x1) * _draw_w) / fb->width);
-            int sy1 = static_cast<int>((static_cast<int64_t>(y1) * _draw_h) / fb->height);
-            int sx2 = static_cast<int>((static_cast<int64_t>(x2) * _draw_w) / fb->width);
-            int sy2 = static_cast<int>((static_cast<int64_t>(y2) * _draw_h) / fb->height);
-#if BSP_CONFIG_NO_GRAPHIC_LIB
-            dl::image::draw_hollow_rectangle(*fb, sx1, sy1, sx2, sy2, kAlertColor, 2);
-#else
-            lv_draw_rect_dsc_t rect_dsc;
-            lv_draw_rect_dsc_init(&rect_dsc);
-            rect_dsc.bg_opa = LV_OPA_TRANSP;
-            rect_dsc.border_width = 2;
-            rect_dsc.border_color = get_lv_color(true);
-            lv_layer_t layer;
-            lv_canvas_init_layer(m_lcd_disp->get_canvas(), &layer);
-            lv_area_t area = {sx1, sy1, sx2, sy2};
-            lv_draw_rect(&layer, &rect_dsc, &area);
-            lv_canvas_finish_layer(m_lcd_disp->get_canvas(), &layer);
-#endif
-            cnt++;
-        }
-#if !BSP_CONFIG_NO_GRAPHIC_LIB
-        if (m_label) {
-            if (!ready) {
-                lv_label_set_text_fmt(m_label, "Calibrating %u/%u", static_cast<unsigned>(bootstrap_count), kBootstrapFrames);
-            } else {
-                lv_label_set_text_fmt(m_label, "Hands: %u", cnt);
-            }
-        }
-#else
-        ESP_LOGI(TAG, "Hands: %u", cnt);
-#endif
-    }
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     if (!m_detection_enabled) {

@@ -241,7 +241,10 @@ WhoPPAResizeNode::WhoPPAResizeNode(const std::string &name,
         img.height = dst_h;
         img.pix_type = dst_pix_type;
         if (i == 0) {
-            m_buf_size = dl::image::align_up(dl::image::get_img_byte_size(img), align);
+            m_buf_size = dl::image::align_up(
+            img.width * img.height * dl::image::get_pix_byte_size(img.pix_type),
+            align
+        );
         }
         img.data = heap_caps_aligned_calloc(align, 1, m_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     }

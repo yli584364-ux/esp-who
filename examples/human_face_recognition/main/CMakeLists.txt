@@ -10,8 +10,7 @@ set(requires who_spiflash_fatfs
              who_task
              who_frame_cap
              who_frame_lcd_disp
-             who_lcd
-             hand_detect)
+             who_lcd)
 
 idf_component_register(SRCS ${srcs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
 

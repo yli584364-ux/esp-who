@@ -6,7 +6,6 @@
 #include "who_frame_cap.hpp"
 #include "who_frame_lcd_disp.hpp"
 #include "who_task.hpp"
-#include "hand_detect.hpp"
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
 #include "lvgl.h"
@@ -87,7 +86,6 @@ private:
     frame_cap::WhoFrameCap *m_frame_cap;
     lcd_disp::WhoFrameLCDDisp *m_lcd_disp;
     IntrusionMonitorTask *m_monitor_task;
-    HandDetect *m_hand_detect;
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     lv_obj_t *m_label;
