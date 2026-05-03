@@ -3,11 +3,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <list>
 
 #include "bsp/esp-bsp.h"
 #include "dl_image.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "hand_detect.hpp"
 #include "who_lvgl_utils.hpp"
 #include "who_yield2idle.hpp"
 
@@ -18,8 +20,59 @@ static constexpr uint16_t kMaxConsecutiveFailures = 8;
 static constexpr const char *TAG = "BoundaryMonitor";
 static constexpr uint16_t kPreviewScalePercent = 78;
 static constexpr uint16_t kMinCustomBoundarySpan = 8;
+static constexpr size_t kImageBufferAlignment = 16;
+static constexpr int32_t kHandBoundaryTouchPixels = 5;
 static const std::vector<uint8_t> kNormalColor = {0, 255, 0};
 static const std::vector<uint8_t> kAlertColor = {255, 0, 0};
+static const std::vector<uint8_t> kRgb565LeRed = {0x00, 0xF8};
+
+struct rect_i32_t {
+    int32_t x1;
+    int32_t y1;
+    int32_t x2;
+    int32_t y2;
+};
+
+int32_t clamp_i32(int32_t value, int32_t min_value, int32_t max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+int32_t overlap_len(int32_t a1, int32_t a2, int32_t b1, int32_t b2)
+{
+    int32_t lo = a1 > b1 ? a1 : b1;
+    int32_t hi = a2 < b2 ? a2 : b2;
+    return hi > lo ? hi - lo : 0;
+}
+
+bool box_touches_rect_edge(const rect_i32_t &box, const rect_i32_t &rect, int32_t threshold)
+{
+    bool touches_left = box.x1 <= rect.x1 + threshold && box.x2 >= rect.x1 - threshold &&
+                        overlap_len(box.y1, box.y2, rect.y1, rect.y2) > threshold;
+    bool touches_right = box.x1 <= rect.x2 + threshold && box.x2 >= rect.x2 - threshold &&
+                         overlap_len(box.y1, box.y2, rect.y1, rect.y2) > threshold;
+    bool touches_top = box.y1 <= rect.y1 + threshold && box.y2 >= rect.y1 - threshold &&
+                       overlap_len(box.x1, box.x2, rect.x1, rect.x2) > threshold;
+    bool touches_bottom = box.y1 <= rect.y2 + threshold && box.y2 >= rect.y2 - threshold &&
+                          overlap_len(box.x1, box.x2, rect.x1, rect.x2) > threshold;
+    return touches_left || touches_right || touches_top || touches_bottom;
+}
+
+uint8_t rgb565_to_gray(uint16_t pixel)
+{
+    uint8_t r = static_cast<uint8_t>(((pixel >> 11) & 0x1F) << 3);
+    uint8_t g = static_cast<uint8_t>(((pixel >> 5) & 0x3F) << 2);
+    uint8_t b = static_cast<uint8_t>((pixel & 0x1F) << 3);
+    return static_cast<uint8_t>((static_cast<uint16_t>(r) * 77u + static_cast<uint16_t>(g) * 150u +
+                                 static_cast<uint16_t>(b) * 29u) >>
+                                8);
+}
 
 void resize_rgb565_nearest(
     const uint16_t *src,
@@ -45,18 +98,17 @@ lv_color_t get_lv_color(bool intrusion)
     return who::cvt_to_lv_color(intrusion ? kAlertColor : kNormalColor);
 }
 
-void draw_custom_boundary_on_canvas(lv_obj_t *canvas, lv_point_t p1, lv_point_t p2, bool intrusion)
+void draw_rect_on_canvas(lv_obj_t *canvas, int32_t x1, int32_t y1, int32_t x2, int32_t y2, lv_color_t color, uint8_t width)
 {
-    int32_t x1 = p1.x < p2.x ? p1.x : p2.x;
-    int32_t x2 = p1.x < p2.x ? p2.x : p1.x;
-    int32_t y1 = p1.y < p2.y ? p1.y : p2.y;
-    int32_t y2 = p1.y < p2.y ? p2.y : p1.y;
+    if (x2 <= x1 || y2 <= y1) {
+        return;
+    }
 
     lv_draw_rect_dsc_t rect_dsc;
     lv_draw_rect_dsc_init(&rect_dsc);
     rect_dsc.bg_opa = LV_OPA_TRANSP;
-    rect_dsc.border_width = intrusion ? 4 : 2;
-    rect_dsc.border_color = intrusion ? get_lv_color(true) : lv_color_hex(0x4FC3F7);
+    rect_dsc.border_width = width;
+    rect_dsc.border_color = color;
 
     lv_layer_t layer;
     lv_canvas_init_layer(canvas, &layer);
@@ -65,24 +117,25 @@ void draw_custom_boundary_on_canvas(lv_obj_t *canvas, lv_point_t p1, lv_point_t 
     lv_canvas_finish_layer(canvas, &layer);
 }
 
+void draw_custom_boundary_on_canvas(lv_obj_t *canvas, lv_point_t p1, lv_point_t p2, bool intrusion)
+{
+    int32_t x1 = p1.x < p2.x ? p1.x : p2.x;
+    int32_t x2 = p1.x < p2.x ? p2.x : p1.x;
+    int32_t y1 = p1.y < p2.y ? p1.y : p2.y;
+    int32_t y2 = p1.y < p2.y ? p2.y : p1.y;
+
+    draw_rect_on_canvas(canvas, x1, y1, x2, y2, intrusion ? get_lv_color(true) : lv_color_hex(0x4FC3F7), intrusion ? 4 : 2);
+}
+
 void draw_boundary_on_canvas(lv_obj_t *canvas, uint16_t width, uint16_t height, uint16_t border_width, bool intrusion)
 {
-    lv_draw_rect_dsc_t rect_dsc;
-    lv_draw_rect_dsc_init(&rect_dsc);
-    rect_dsc.bg_opa = LV_OPA_TRANSP;
-    rect_dsc.border_width = intrusion ? 4 : 2;
-    rect_dsc.border_color = get_lv_color(intrusion);
-
-    lv_layer_t layer;
-    lv_canvas_init_layer(canvas, &layer);
-    lv_area_t area = {
-        static_cast<int32_t>(border_width),
-        static_cast<int32_t>(border_width),
-        static_cast<int32_t>(width - border_width - 1),
-        static_cast<int32_t>(height - border_width - 1),
-    };
-    lv_draw_rect(&layer, &rect_dsc, &area);
-    lv_canvas_finish_layer(canvas, &layer);
+    draw_rect_on_canvas(canvas,
+                        border_width,
+                        border_width,
+                        width - border_width - 1,
+                        height - border_width - 1,
+                        get_lv_color(intrusion),
+                        intrusion ? 4 : 2);
 }
 
 lv_obj_t *create_action_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *user_data)
@@ -116,6 +169,7 @@ IntrusionMonitorTask::IntrusionMonitorTask(const std::string &name, frame_cap::W
     m_border_width(0),
     m_caps(0),
     m_reset_requested(false),
+    m_processing_enabled(false),
     m_custom_boundary_update_pending(false),
     m_custom_boundary_enable_pending(false),
     m_custom_boundary_rect_pending(0),
@@ -171,6 +225,11 @@ void IntrusionMonitorTask::request_reset()
     m_reset_requested.store(true);
 }
 
+void IntrusionMonitorTask::set_processing_enabled(bool enabled)
+{
+    m_processing_enabled.store(enabled);
+}
+
 void IntrusionMonitorTask::request_custom_boundary(bool enabled, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
 {
     uint32_t packed = (static_cast<uint32_t>(x1) << 24) | (static_cast<uint32_t>(y1) << 16) |
@@ -194,6 +253,11 @@ void IntrusionMonitorTask::task()
             if (pause_event_bits & TASK_STOP) {
                 break;
             }
+            continue;
+        }
+
+        if (!m_processing_enabled.load()) {
+            cleanup();
             continue;
         }
 
@@ -312,7 +376,7 @@ bool IntrusionMonitorTask::init_detector_if_needed(who::cam::cam_fb_t *fb)
 
     (void)fb;
     m_pixels = static_cast<size_t>(DETECT_WIDTH) * static_cast<size_t>(DETECT_HEIGHT);
-    m_gray_frame = static_cast<uint8_t *>(heap_caps_malloc(m_pixels, MALLOC_CAP_DEFAULT));
+    m_gray_frame = static_cast<uint8_t *>(heap_caps_aligned_calloc(kImageBufferAlignment, 1, m_pixels, MALLOC_CAP_DEFAULT));
     m_bootstrap_frames = static_cast<uint8_t **>(calloc(kBootstrapFrames, sizeof(uint8_t *)));
     if (!m_gray_frame || !m_bootstrap_frames) {
         ESP_LOGE(TAG, "gray frame allocation failed");
@@ -321,7 +385,8 @@ bool IntrusionMonitorTask::init_detector_if_needed(who::cam::cam_fb_t *fb)
     }
 
     for (size_t i = 0; i < kBootstrapFrames; ++i) {
-        m_bootstrap_frames[i] = static_cast<uint8_t *>(heap_caps_malloc(m_pixels, MALLOC_CAP_DEFAULT));
+        m_bootstrap_frames[i] =
+            static_cast<uint8_t *>(heap_caps_aligned_calloc(kImageBufferAlignment, 1, m_pixels, MALLOC_CAP_DEFAULT));
         if (!m_bootstrap_frames[i]) {
             ESP_LOGE(TAG, "bootstrap frame allocation failed");
             cleanup();
@@ -352,13 +417,41 @@ bool IntrusionMonitorTask::init_detector_if_needed(who::cam::cam_fb_t *fb)
 
 bool IntrusionMonitorTask::convert_to_gray(who::cam::cam_fb_t *fb)
 {
-    dl::image::img_t gray = {
-        .data = m_gray_frame,
-        .width = DETECT_WIDTH,
-        .height = DETECT_HEIGHT,
-        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_GRAY,
-    };
-    return m_image_transformer.set_src_img(*fb).set_dst_img(gray).transform() == ESP_OK;
+    if (!fb || !fb->buf || !m_gray_frame || fb->width == 0 || fb->height == 0) {
+        return false;
+    }
+
+    if (fb->format == who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB565) {
+        const uint16_t *src = static_cast<const uint16_t *>(fb->buf);
+        for (uint16_t y = 0; y < DETECT_HEIGHT; ++y) {
+            uint16_t sy = static_cast<uint16_t>((static_cast<uint32_t>(y) * fb->height) / DETECT_HEIGHT);
+            for (uint16_t x = 0; x < DETECT_WIDTH; ++x) {
+                uint16_t sx = static_cast<uint16_t>((static_cast<uint32_t>(x) * fb->width) / DETECT_WIDTH);
+                m_gray_frame[static_cast<size_t>(y) * DETECT_WIDTH + x] =
+                    rgb565_to_gray(src[static_cast<size_t>(sy) * fb->width + sx]);
+            }
+        }
+        return true;
+    }
+
+    if (fb->format == who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB888) {
+        const uint8_t *src = static_cast<const uint8_t *>(fb->buf);
+        for (uint16_t y = 0; y < DETECT_HEIGHT; ++y) {
+            uint16_t sy = static_cast<uint16_t>((static_cast<uint32_t>(y) * fb->height) / DETECT_HEIGHT);
+            for (uint16_t x = 0; x < DETECT_WIDTH; ++x) {
+                uint16_t sx = static_cast<uint16_t>((static_cast<uint32_t>(x) * fb->width) / DETECT_WIDTH);
+                const uint8_t *pixel = src + (static_cast<size_t>(sy) * fb->width + sx) * 3u;
+                m_gray_frame[static_cast<size_t>(y) * DETECT_WIDTH + x] =
+                    static_cast<uint8_t>((static_cast<uint16_t>(pixel[0]) * 77u +
+                                          static_cast<uint16_t>(pixel[1]) * 150u +
+                                          static_cast<uint16_t>(pixel[2]) * 29u) >>
+                                         8);
+            }
+        }
+        return true;
+    }
+
+    return false;
 }
 
 uint16_t IntrusionMonitorTask::calc_border_width(const intrusion_detector_config_t &cfg)
@@ -374,14 +467,106 @@ uint16_t IntrusionMonitorTask::calc_border_width(const intrusion_detector_config
     return border_width == 0u ? 1u : border_width;
 }
 
+HandDetectTask::HandDetectTask(const std::string &name, frame_cap::WhoFrameCapNode *frame_cap_node) :
+    task::WhoTask(name),
+    m_frame_cap_node(frame_cap_node),
+    m_detector(new HandDetect(HandDetect::ESPDET_PICO_224_224_HAND, true)),
+    m_result_mutex(xSemaphoreCreateMutex()),
+    m_result()
+{
+    m_result.ready = false;
+    frame_cap_node->add_new_frame_signal_subscriber(this);
+}
+
+HandDetectTask::~HandDetectTask()
+{
+    cleanup();
+    vSemaphoreDelete(m_result_mutex);
+    delete m_detector;
+}
+
+bool HandDetectTask::get_result(hand_detection_result_t *result)
+{
+    if (!result) {
+        return false;
+    }
+    xSemaphoreTake(m_result_mutex, portMAX_DELAY);
+    *result = m_result;
+    xSemaphoreGive(m_result_mutex);
+    return true;
+}
+
+void HandDetectTask::clear_result()
+{
+    xSemaphoreTake(m_result_mutex, portMAX_DELAY);
+    m_result.ready = false;
+    m_result.width = 0;
+    m_result.height = 0;
+    m_result.boxes.clear();
+    xSemaphoreGive(m_result_mutex);
+}
+
+void HandDetectTask::task()
+{
+    while (true) {
+        EventBits_t event_bits =
+            xEventGroupWaitBits(m_event_group, NEW_FRAME | TASK_PAUSE | TASK_STOP, pdTRUE, pdFALSE, portMAX_DELAY);
+        if (event_bits & TASK_STOP) {
+            break;
+        } else if (event_bits & TASK_PAUSE) {
+            xEventGroupSetBits(m_event_group, TASK_PAUSED);
+            EventBits_t pause_event_bits =
+                xEventGroupWaitBits(m_event_group, TASK_RESUME | TASK_STOP, pdTRUE, pdFALSE, portMAX_DELAY);
+            if (pause_event_bits & TASK_STOP) {
+                break;
+            }
+            continue;
+        }
+
+        auto fb = m_frame_cap_node->cam_fb_peek();
+        if (!fb || !fb->buf ||
+            (fb->format != who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB565 &&
+             fb->format != who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB888)) {
+            continue;
+        }
+
+        dl::image::img_t img = *fb;
+        std::list<dl::detect::result_t> &detect_results = m_detector->run(img);
+
+        hand_detection_result_t result = {};
+        result.ready = true;
+        result.width = fb->width;
+        result.height = fb->height;
+        for (const auto &box : detect_results) {
+            if (box.box.size() >= 4) {
+                result.boxes.push_back(box);
+            }
+        }
+
+        xSemaphoreTake(m_result_mutex, portMAX_DELAY);
+        m_result = result;
+        xSemaphoreGive(m_result_mutex);
+    }
+
+    xEventGroupSetBits(m_event_group, TASK_STOPPED);
+    vTaskDelete(NULL);
+}
+
+void HandDetectTask::cleanup()
+{
+    clear_result();
+}
+
 BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) :
     m_frame_cap(frame_cap),
     m_lcd_disp(new lcd_disp::WhoFrameLCDDisp("LCDDisp", frame_cap->get_last_node(), 0)),
-    m_monitor_task(new IntrusionMonitorTask("BoundaryDetect", frame_cap->get_last_node()))
+    m_monitor_task(new IntrusionMonitorTask("BoundaryDetect", frame_cap->get_last_node())),
+    m_hand_task(new HandDetectTask("HandDetect", frame_cap->get_last_node()))
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     ,
     m_label(nullptr),
     m_control_panel(nullptr),
+    m_combined_btn(nullptr),
     m_start_btn(nullptr),
     m_reset_btn(nullptr),
     m_placeholder_btn_1(nullptr),
@@ -390,7 +575,9 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
     m_preview_w(0),
     m_preview_h(0),
     m_preview_ready(false),
+    m_combined_detection_enabled(false),
     m_detection_enabled(false),
+    m_hand_detection_enabled(false),
     m_boundary_edit_mode(false),
     m_boundary_has_first_point(false),
     m_boundary_enabled(false),
@@ -406,7 +593,7 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
     lv_obj_align(m_label, LV_ALIGN_TOP_LEFT, 8, 8);
 
     m_control_panel = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(m_control_panel, 180, 220);
+    lv_obj_set_size(m_control_panel, 180, 276);
     lv_obj_align(m_control_panel, LV_ALIGN_TOP_RIGHT, -8, 8);
     lv_obj_set_style_pad_all(m_control_panel, 8, 0);
     lv_obj_set_style_bg_opa(m_control_panel, LV_OPA_70, 0);
@@ -417,7 +604,7 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
     lv_obj_t *button_col = lv_obj_create(m_control_panel);
-    lv_obj_set_size(button_col, LV_PCT(100), 168);
+    lv_obj_set_size(button_col, LV_PCT(100), 224);
     lv_obj_align(button_col, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_pad_all(button_col, 0, 0);
     lv_obj_set_style_border_width(button_col, 0, 0);
@@ -426,14 +613,18 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
     lv_obj_set_flex_align(button_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(button_col, 6, 0);
 
+    m_combined_btn =
+        create_action_button(button_col, "Dual Detect", BoundaryMonitorAppLCD::combined_button_event_cb, this);
     m_start_btn = create_action_button(button_col, "Start Detect", BoundaryMonitorAppLCD::start_button_event_cb, this);
     m_reset_btn = create_action_button(button_col, "Reset Range", BoundaryMonitorAppLCD::reset_button_event_cb, this);
     m_placeholder_btn_1 =
         create_action_button(button_col, "Feature 2: Boundary", BoundaryMonitorAppLCD::feature2_button_event_cb, this);
     m_placeholder_btn_2 =
-        create_action_button(button_col, "Feature 3 (Todo)", BoundaryMonitorAppLCD::feature2_button_event_cb, this);
+        create_action_button(button_col, "Feature 3: Hand", BoundaryMonitorAppLCD::feature3_button_event_cb, this);
 
+    update_combined_button_text();
     update_start_button_text();
+    update_feature3_button_text();
     bsp_display_unlock();
 #endif
 }
@@ -450,6 +641,7 @@ BoundaryMonitorAppLCD::~BoundaryMonitorAppLCD()
         bsp_display_lock(0);
         lv_obj_del(m_control_panel);
         m_control_panel = nullptr;
+        m_combined_btn = nullptr;
         m_start_btn = nullptr;
         m_reset_btn = nullptr;
         m_placeholder_btn_1 = nullptr;
@@ -464,6 +656,7 @@ BoundaryMonitorAppLCD::~BoundaryMonitorAppLCD()
         bsp_display_unlock();
     }
 #endif
+    delete m_hand_task;
     delete m_monitor_task;
     delete m_lcd_disp;
 }
@@ -476,9 +669,20 @@ bool BoundaryMonitorAppLCD::run()
     }
     ret &= m_lcd_disp->run(2560, 2, 0);
     ret &= m_monitor_task->run(4096, 2, 1);
+    ret &= m_hand_task->run(6144, 2, 1);
 
     if (ret) {
-        set_detection_enabled(false);
+        m_monitor_task->set_processing_enabled(false);
+        m_monitor_task->pause();
+        m_hand_task->pause();
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+        m_combined_detection_enabled = false;
+        m_detection_enabled = false;
+        m_hand_detection_enabled = false;
+        update_combined_button_text();
+        update_start_button_text();
+        update_feature3_button_text();
+#endif
     }
 
     return ret;
@@ -510,28 +714,44 @@ void BoundaryMonitorAppLCD::lcd_disp_cb(who::cam::cam_fb_t *fb)
     uint16_t border_width = 0;
     m_monitor_task->get_result(&result, &ready, &bootstrap_count, &border_width);
 
-    bool intrusion = ready && result.intrusion;
-    draw_overlay(fb, intrusion, border_width);
+    hand_detection_result_t hand_result = {};
+    m_hand_task->get_result(&hand_result);
+    bool intrusion = m_detection_enabled && ready && result.intrusion;
+    bool hand_boundary_alarm = m_hand_detection_enabled && hand_result.ready &&
+                               hand_touches_boundary(fb, hand_result, border_width);
+    bool alarm = intrusion || hand_boundary_alarm;
+
+    draw_overlay(fb, alarm, border_width);
+
+    if (m_hand_detection_enabled && hand_result.ready) {
+        draw_hand_boxes(fb, hand_result);
+    }
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
-    if (!m_detection_enabled) {
+    if (!m_detection_enabled && !m_hand_detection_enabled) {
         lv_label_set_text(m_label, "Camera paused. Press Start Detect.");
-    } else if (!ready) {
+    } else if (alarm) {
+        lv_label_set_text_fmt(m_label,
+                              "ALERT %s%s hands=%u",
+                              intrusion ? "boundary " : "",
+                              hand_boundary_alarm ? "hand " : "",
+                              static_cast<unsigned>(hand_result.boxes.size()));
+    } else if (m_detection_enabled && !ready) {
         lv_label_set_text_fmt(m_label, "Calibrating %u/%u", static_cast<unsigned>(bootstrap_count), kBootstrapFrames);
     } else {
         lv_label_set_text_fmt(
             m_label,
-            "%s ratio=%.3f fg=%lu/%lu",
-            intrusion ? "ALERT" : "NORMAL",
+            "NORMAL ratio=%.3f fg=%lu/%lu hands=%u",
             result.smoothed_ratio,
             static_cast<unsigned long>(result.fg_pixels),
-            static_cast<unsigned long>(result.border_pixels));
+            static_cast<unsigned long>(result.border_pixels),
+            static_cast<unsigned>(m_hand_detection_enabled && hand_result.ready ? hand_result.boxes.size() : 0));
     }
 #else
-    if (ready) {
+    if (m_detection_enabled && ready) {
         ESP_LOGI(TAG,
                  "%s ratio=%.3f fg=%lu/%lu",
-                 intrusion ? "ALERT" : "NORMAL",
+                 alarm ? "ALERT" : "NORMAL",
                  result.smoothed_ratio,
                  static_cast<unsigned long>(result.fg_pixels),
                  static_cast<unsigned long>(result.border_pixels));
@@ -544,6 +764,14 @@ void BoundaryMonitorAppLCD::reset_button_event_cb(lv_event_t *e)
     auto *self = static_cast<BoundaryMonitorAppLCD *>(lv_event_get_user_data(e));
     if (self) {
         self->request_range_reset();
+    }
+}
+
+void BoundaryMonitorAppLCD::combined_button_event_cb(lv_event_t *e)
+{
+    auto *self = static_cast<BoundaryMonitorAppLCD *>(lv_event_get_user_data(e));
+    if (self) {
+        self->set_combined_detection_enabled(!self->m_combined_detection_enabled);
     }
 }
 
@@ -560,6 +788,14 @@ void BoundaryMonitorAppLCD::feature2_button_event_cb(lv_event_t *e)
     auto *self = static_cast<BoundaryMonitorAppLCD *>(lv_event_get_user_data(e));
     if (self) {
         self->handle_feature2_action();
+    }
+}
+
+void BoundaryMonitorAppLCD::feature3_button_event_cb(lv_event_t *e)
+{
+    auto *self = static_cast<BoundaryMonitorAppLCD *>(lv_event_get_user_data(e));
+    if (self) {
+        self->set_hand_detection_enabled(!self->m_hand_detection_enabled);
     }
 }
 
@@ -733,18 +969,106 @@ void BoundaryMonitorAppLCD::set_detection_enabled(bool enabled)
         return;
     }
 
+    if (m_combined_detection_enabled) {
+        set_combined_detection_enabled(false);
+        if (!enabled) {
+            return;
+        }
+    }
+
     if (enabled) {
+        if (m_hand_detection_enabled) {
+            set_hand_detection_enabled(false);
+        }
+        m_monitor_task->set_processing_enabled(true);
         m_monitor_task->request_reset();
         m_monitor_task->resume();
         for (const auto &frame_cap_node : m_frame_cap->get_all_nodes()) {
             frame_cap_node->resume();
         }
     } else {
+        m_monitor_task->set_processing_enabled(false);
         m_monitor_task->pause();
     }
 
     m_detection_enabled = enabled;
     update_start_button_text();
+}
+
+void BoundaryMonitorAppLCD::set_hand_detection_enabled(bool enabled)
+{
+    if (enabled == m_hand_detection_enabled) {
+        return;
+    }
+
+    if (m_combined_detection_enabled) {
+        set_combined_detection_enabled(false);
+        if (!enabled) {
+            return;
+        }
+    }
+
+    if (enabled) {
+        if (m_detection_enabled) {
+            set_detection_enabled(false);
+        }
+        m_hand_task->clear_result();
+        m_hand_task->resume();
+        for (const auto &frame_cap_node : m_frame_cap->get_all_nodes()) {
+            frame_cap_node->resume();
+        }
+    } else {
+        m_hand_task->pause();
+        m_hand_task->clear_result();
+    }
+
+    m_hand_detection_enabled = enabled;
+    update_feature3_button_text();
+}
+
+void BoundaryMonitorAppLCD::set_combined_detection_enabled(bool enabled)
+{
+    if (enabled == m_combined_detection_enabled) {
+        return;
+    }
+
+    if (enabled) {
+        m_monitor_task->set_processing_enabled(true);
+        m_monitor_task->request_reset();
+        m_monitor_task->resume();
+        m_hand_task->clear_result();
+        m_hand_task->resume();
+        for (const auto &frame_cap_node : m_frame_cap->get_all_nodes()) {
+            frame_cap_node->resume();
+        }
+        m_detection_enabled = true;
+        m_hand_detection_enabled = true;
+    } else {
+        m_monitor_task->set_processing_enabled(false);
+        m_monitor_task->pause();
+        m_hand_task->pause();
+        m_hand_task->clear_result();
+        m_detection_enabled = false;
+        m_hand_detection_enabled = false;
+    }
+
+    m_combined_detection_enabled = enabled;
+    update_combined_button_text();
+    update_start_button_text();
+    update_feature3_button_text();
+}
+
+void BoundaryMonitorAppLCD::update_combined_button_text()
+{
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (!m_combined_btn) {
+        return;
+    }
+    lv_obj_t *label = lv_obj_get_child(m_combined_btn, 0);
+    if (label) {
+        lv_label_set_text(label, m_combined_detection_enabled ? "Stop Dual Detect" : "Dual Detect");
+    }
+#endif
 }
 
 void BoundaryMonitorAppLCD::update_start_button_text()
@@ -756,6 +1080,19 @@ void BoundaryMonitorAppLCD::update_start_button_text()
     lv_obj_t *label = lv_obj_get_child(m_start_btn, 0);
     if (label) {
         lv_label_set_text(label, m_detection_enabled ? "Pause Detect" : "Start Detect");
+    }
+#endif
+}
+
+void BoundaryMonitorAppLCD::update_feature3_button_text()
+{
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (!m_placeholder_btn_2) {
+        return;
+    }
+    lv_obj_t *label = lv_obj_get_child(m_placeholder_btn_2, 0);
+    if (label) {
+        lv_label_set_text(label, m_hand_detection_enabled ? "Stop Hand Detect" : "Feature 3: Hand");
     }
 #endif
 }
@@ -792,6 +1129,127 @@ void BoundaryMonitorAppLCD::draw_overlay(who::cam::cam_fb_t *fb, bool intrusion,
         draw_boundary_on_canvas(m_lcd_disp->get_canvas(), draw_w, draw_h, border_width, intrusion);
     }
 #endif
+}
+
+void BoundaryMonitorAppLCD::draw_hand_boxes(who::cam::cam_fb_t *fb, const hand_detection_result_t &result)
+{
+    if (!fb || result.width == 0 || result.height == 0 || result.boxes.empty()) {
+        return;
+    }
+
+    uint16_t draw_w = fb->width;
+    uint16_t draw_h = fb->height;
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (m_preview_ready) {
+        draw_w = m_preview_w;
+        draw_h = m_preview_h;
+    }
+#endif
+
+    for (const auto &hand : result.boxes) {
+        if (hand.box.size() < 4) {
+            continue;
+        }
+
+        int32_t x1 = static_cast<int32_t>((static_cast<int64_t>(hand.box[0]) * draw_w) / result.width);
+        int32_t y1 = static_cast<int32_t>((static_cast<int64_t>(hand.box[1]) * draw_h) / result.height);
+        int32_t x2 = static_cast<int32_t>((static_cast<int64_t>(hand.box[2]) * draw_w) / result.width);
+        int32_t y2 = static_cast<int32_t>((static_cast<int64_t>(hand.box[3]) * draw_h) / result.height);
+
+        if (x1 < 0) {
+            x1 = 0;
+        }
+        if (y1 < 0) {
+            y1 = 0;
+        }
+        if (x2 >= draw_w) {
+            x2 = draw_w - 1;
+        }
+        if (y2 >= draw_h) {
+            y2 = draw_h - 1;
+        }
+        if (x2 <= x1 || y2 <= y1) {
+            continue;
+        }
+
+#if BSP_CONFIG_NO_GRAPHIC_LIB
+        dl::image::img_t img = *fb;
+        const std::vector<uint8_t> &color =
+            img.pix_type == dl::image::DL_IMAGE_PIX_TYPE_RGB565LE ? kRgb565LeRed : kAlertColor;
+        dl::image::draw_hollow_rectangle(img, x1, y1, x2, y2, color, 3);
+#else
+        draw_rect_on_canvas(m_lcd_disp->get_canvas(), x1, y1, x2, y2, get_lv_color(true), 3);
+#endif
+    }
+}
+
+bool BoundaryMonitorAppLCD::hand_touches_boundary(
+    who::cam::cam_fb_t *fb,
+    const hand_detection_result_t &result,
+    uint16_t border_width
+) const
+{
+    if (!fb || result.width == 0 || result.height == 0 || result.boxes.empty()) {
+        return false;
+    }
+
+    uint16_t draw_w = fb->width;
+    uint16_t draw_h = fb->height;
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (m_preview_ready) {
+        draw_w = m_preview_w;
+        draw_h = m_preview_h;
+    }
+#endif
+
+    rect_i32_t boundary = {};
+#if !BSP_CONFIG_NO_GRAPHIC_LIB
+    if (m_boundary_enabled) {
+        boundary.x1 = m_boundary_p1.x < m_boundary_p2.x ? m_boundary_p1.x : m_boundary_p2.x;
+        boundary.x2 = m_boundary_p1.x < m_boundary_p2.x ? m_boundary_p2.x : m_boundary_p1.x;
+        boundary.y1 = m_boundary_p1.y < m_boundary_p2.y ? m_boundary_p1.y : m_boundary_p2.y;
+        boundary.y2 = m_boundary_p1.y < m_boundary_p2.y ? m_boundary_p2.y : m_boundary_p1.y;
+    } else
+#endif
+    {
+        uint16_t scaled_border_width = scale_border_width(draw_w, draw_h, border_width);
+        if (scaled_border_width == 0 || scaled_border_width * 2 >= draw_w || scaled_border_width * 2 >= draw_h) {
+            return false;
+        }
+        boundary = {
+            static_cast<int32_t>(scaled_border_width),
+            static_cast<int32_t>(scaled_border_width),
+            static_cast<int32_t>(draw_w - scaled_border_width - 1),
+            static_cast<int32_t>(draw_h - scaled_border_width - 1),
+        };
+    }
+
+    for (const auto &hand : result.boxes) {
+        if (hand.box.size() < 4) {
+            continue;
+        }
+
+        rect_i32_t box = {
+            static_cast<int32_t>((static_cast<int64_t>(hand.box[0]) * draw_w) / result.width),
+            static_cast<int32_t>((static_cast<int64_t>(hand.box[1]) * draw_h) / result.height),
+            static_cast<int32_t>((static_cast<int64_t>(hand.box[2]) * draw_w) / result.width),
+            static_cast<int32_t>((static_cast<int64_t>(hand.box[3]) * draw_h) / result.height),
+        };
+
+        box.x1 = clamp_i32(box.x1, 0, draw_w - 1);
+        box.y1 = clamp_i32(box.y1, 0, draw_h - 1);
+        box.x2 = clamp_i32(box.x2, 0, draw_w - 1);
+        box.y2 = clamp_i32(box.y2, 0, draw_h - 1);
+        if (box.x2 <= box.x1 || box.y2 <= box.y1) {
+            continue;
+        }
+
+        if (box_touches_rect_edge(box, boundary, kHandBoundaryTouchPixels)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 uint16_t BoundaryMonitorAppLCD::scale_border_width(
