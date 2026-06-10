@@ -1,26 +1,20 @@
-#include "boundary_monitor_app.hpp"
+#include "lcd_show.hpp"
 
-#include <cstdlib>
-#include <cstring>
 #include <functional>
-#include <list>
+#include <vector>
 
+#include "boundary_monitor_lvgl.hpp"
 #include "bsp/esp-bsp.h"
 #include "dl_image.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "hand_detect.hpp"
-#include "who_lvgl_utils.hpp"
 #include "who_yield2idle.hpp"
 
 namespace {
 
-static constexpr size_t kBootstrapFrames = 8;
-static constexpr uint16_t kMaxConsecutiveFailures = 8;
-static constexpr const char *TAG = "BoundaryMonitor";
+static constexpr const char *TAG = "LCDShow";
 static constexpr uint16_t kPreviewScalePercent = 78;
 static constexpr uint16_t kMinCustomBoundarySpan = 8;
-static constexpr size_t kImageBufferAlignment = 16;
 static constexpr int32_t kHandBoundaryTouchPixels = 5;
 static const std::vector<uint8_t> kNormalColor = {0, 255, 0};
 static const std::vector<uint8_t> kAlertColor = {255, 0, 0};
@@ -64,16 +58,6 @@ bool box_touches_rect_edge(const rect_i32_t &box, const rect_i32_t &rect, int32_
     return touches_left || touches_right || touches_top || touches_bottom;
 }
 
-uint8_t rgb565_to_gray(uint16_t pixel)
-{
-    uint8_t r = static_cast<uint8_t>(((pixel >> 11) & 0x1F) << 3);
-    uint8_t g = static_cast<uint8_t>(((pixel >> 5) & 0x3F) << 2);
-    uint8_t b = static_cast<uint8_t>((pixel & 0x1F) << 3);
-    return static_cast<uint8_t>((static_cast<uint16_t>(r) * 77u + static_cast<uint16_t>(g) * 150u +
-                                 static_cast<uint16_t>(b) * 29u) >>
-                                8);
-}
-
 void resize_rgb565_nearest(
     const uint16_t *src,
     uint16_t src_w,
@@ -92,470 +76,10 @@ void resize_rgb565_nearest(
     }
 }
 
-#if !BSP_CONFIG_NO_GRAPHIC_LIB
-lv_color_t get_lv_color(bool intrusion)
-{
-    return who::cvt_to_lv_color(intrusion ? kAlertColor : kNormalColor);
-}
-
-void draw_rect_on_canvas(lv_obj_t *canvas, int32_t x1, int32_t y1, int32_t x2, int32_t y2, lv_color_t color, uint8_t width)
-{
-    if (x2 <= x1 || y2 <= y1) {
-        return;
-    }
-
-    lv_draw_rect_dsc_t rect_dsc;
-    lv_draw_rect_dsc_init(&rect_dsc);
-    rect_dsc.bg_opa = LV_OPA_TRANSP;
-    rect_dsc.border_width = width;
-    rect_dsc.border_color = color;
-
-    lv_layer_t layer;
-    lv_canvas_init_layer(canvas, &layer);
-    lv_area_t area = {x1, y1, x2, y2};
-    lv_draw_rect(&layer, &rect_dsc, &area);
-    lv_canvas_finish_layer(canvas, &layer);
-}
-
-void draw_custom_boundary_on_canvas(lv_obj_t *canvas, lv_point_t p1, lv_point_t p2, bool intrusion)
-{
-    int32_t x1 = p1.x < p2.x ? p1.x : p2.x;
-    int32_t x2 = p1.x < p2.x ? p2.x : p1.x;
-    int32_t y1 = p1.y < p2.y ? p1.y : p2.y;
-    int32_t y2 = p1.y < p2.y ? p2.y : p1.y;
-
-    draw_rect_on_canvas(canvas, x1, y1, x2, y2, intrusion ? get_lv_color(true) : lv_color_hex(0x4FC3F7), intrusion ? 4 : 2);
-}
-
-void draw_boundary_on_canvas(lv_obj_t *canvas, uint16_t width, uint16_t height, uint16_t border_width, bool intrusion)
-{
-    draw_rect_on_canvas(canvas,
-                        border_width,
-                        border_width,
-                        width - border_width - 1,
-                        height - border_width - 1,
-                        get_lv_color(intrusion),
-                        intrusion ? 4 : 2);
-}
-
-lv_obj_t *create_action_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *user_data)
-{
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_width(btn, LV_PCT(100));
-    lv_obj_set_height(btn, 42);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
-    lv_obj_t *label = lv_label_create(btn);
-    lv_label_set_text(label, text);
-    lv_obj_center(label);
-    return btn;
-}
-#endif
-
 } // namespace
 
 namespace who {
 namespace app {
-
-IntrusionMonitorTask::IntrusionMonitorTask(const std::string &name, frame_cap::WhoFrameCapNode *frame_cap_node) :
-    task::WhoTask(name),
-    m_frame_cap_node(frame_cap_node),
-    m_result_mutex(xSemaphoreCreateMutex()),
-    m_result(),
-    m_gray_frame(nullptr),
-    m_bootstrap_frames(nullptr),
-    m_pixels(0),
-    m_bootstrap_count(0),
-    m_detector_ready(false),
-    m_border_width(0),
-    m_caps(0),
-    m_reset_requested(false),
-    m_processing_enabled(false),
-    m_custom_boundary_update_pending(false),
-    m_custom_boundary_enable_pending(false),
-    m_custom_boundary_rect_pending(0),
-    m_custom_boundary_enabled(false),
-    m_custom_x1(0),
-    m_custom_y1(0),
-    m_custom_x2(0),
-    m_custom_y2(0),
-    m_consecutive_failures(0)
-{
-    memset(&m_detector, 0, sizeof(m_detector));
-    memset(&m_cfg, 0, sizeof(m_cfg));
-    frame_cap_node->add_new_frame_signal_subscriber(this);
-#if CONFIG_IDF_TARGET_ESP32S3
-    m_caps = dl::image::DL_IMAGE_CAP_RGB565_BIG_ENDIAN;
-#endif
-    
-}
-
-
-IntrusionMonitorTask::~IntrusionMonitorTask()
-{
-    cleanup();
-    vSemaphoreDelete(m_result_mutex);
-}
-
-bool IntrusionMonitorTask::get_result(
-    intrusion_detector_result_t *result,
-    bool *ready,
-    size_t *bootstrap_count,
-    uint16_t *border_width
-)
-{
-    xSemaphoreTake(m_result_mutex, portMAX_DELAY);
-    if (result) {
-        *result = m_result;
-    }
-    if (ready) {
-        *ready = m_detector_ready;
-    }
-    if (bootstrap_count) {
-        *bootstrap_count = m_bootstrap_count;
-    }
-    if (border_width) {
-        *border_width = m_border_width;
-    }
-    xSemaphoreGive(m_result_mutex);
-    return true;
-}
-
-void IntrusionMonitorTask::request_reset()
-{
-    m_reset_requested.store(true);
-}
-
-void IntrusionMonitorTask::set_processing_enabled(bool enabled)
-{
-    m_processing_enabled.store(enabled);
-}
-
-void IntrusionMonitorTask::request_custom_boundary(bool enabled, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
-{
-    uint32_t packed = (static_cast<uint32_t>(x1) << 24) | (static_cast<uint32_t>(y1) << 16) |
-                      (static_cast<uint32_t>(x2) << 8) | static_cast<uint32_t>(y2);
-    m_custom_boundary_rect_pending.store(packed);
-    m_custom_boundary_enable_pending.store(enabled);
-    m_custom_boundary_update_pending.store(true);
-}
-
-void IntrusionMonitorTask::task()
-{
-    while (true) {
-        EventBits_t event_bits =
-            xEventGroupWaitBits(m_event_group, NEW_FRAME | TASK_PAUSE | TASK_STOP, pdTRUE, pdFALSE, portMAX_DELAY);
-        if (event_bits & TASK_STOP) {
-            break;
-        } else if (event_bits & TASK_PAUSE) {
-            xEventGroupSetBits(m_event_group, TASK_PAUSED);
-            EventBits_t pause_event_bits =
-                xEventGroupWaitBits(m_event_group, TASK_RESUME | TASK_STOP, pdTRUE, pdFALSE, portMAX_DELAY);
-            if (pause_event_bits & TASK_STOP) {
-                break;
-            }
-            continue;
-        }
-
-        if (!m_processing_enabled.load()) {
-            cleanup();
-            continue;
-        }
-
-        if (m_reset_requested.exchange(false)) {
-            ESP_LOGI(TAG, "manual reset requested, restarting calibration");
-            cleanup();
-            continue;
-        }
-
-        if (m_custom_boundary_update_pending.exchange(false)) {
-            uint32_t packed = m_custom_boundary_rect_pending.load();
-            m_custom_x1 = static_cast<uint16_t>((packed >> 24) & 0xFFu);
-            m_custom_y1 = static_cast<uint16_t>((packed >> 16) & 0xFFu);
-            m_custom_x2 = static_cast<uint16_t>((packed >> 8) & 0xFFu);
-            m_custom_y2 = static_cast<uint16_t>(packed & 0xFFu);
-            m_custom_boundary_enabled = m_custom_boundary_enable_pending.load();
-            ESP_LOGI(TAG,
-                     "custom boundary %s (%u,%u)-(%u,%u)",
-                     m_custom_boundary_enabled ? "enabled" : "disabled",
-                     static_cast<unsigned>(m_custom_x1),
-                     static_cast<unsigned>(m_custom_y1),
-                     static_cast<unsigned>(m_custom_x2),
-                     static_cast<unsigned>(m_custom_y2));
-            cleanup();
-            continue;
-        }
-
-        auto fb = m_frame_cap_node->cam_fb_peek();
-        if (!fb || !init_detector_if_needed(fb) || !convert_to_gray(fb)) {
-            if (m_consecutive_failures < UINT16_MAX) {
-                m_consecutive_failures++;
-            }
-            if (m_consecutive_failures >= kMaxConsecutiveFailures) {
-                ESP_LOGW(TAG, "too many detector failures, resetting detector state");
-                cleanup();
-                m_consecutive_failures = 0;
-            }
-            continue;
-        }
-
-        if (m_bootstrap_count < kBootstrapFrames) {
-            memcpy(m_bootstrap_frames[m_bootstrap_count], m_gray_frame, m_pixels);
-            m_bootstrap_count++;
-            if (m_bootstrap_count == kBootstrapFrames) {
-                const uint8_t *bootstrap_frames[kBootstrapFrames];
-                for (size_t i = 0; i < kBootstrapFrames; ++i) {
-                    bootstrap_frames[i] = m_bootstrap_frames[i];
-                }
-                if (!intrusion_detector_bootstrap(&m_detector, bootstrap_frames, kBootstrapFrames)) {
-                    ESP_LOGE(TAG, "intrusion_detector_bootstrap failed");
-                }
-            }
-            m_consecutive_failures = 0;
-            continue;
-        }
-
-        intrusion_detector_result_t result = {};
-        if (!intrusion_detector_process(&m_detector, m_gray_frame, &result)) {
-            ESP_LOGW(TAG, "intrusion_detector_process failed");
-            if (m_consecutive_failures < UINT16_MAX) {
-                m_consecutive_failures++;
-            }
-            if (m_consecutive_failures >= kMaxConsecutiveFailures) {
-                ESP_LOGW(TAG, "processing keeps failing, resetting detector state");
-                cleanup();
-                m_consecutive_failures = 0;
-            }
-            continue;
-        }
-        m_consecutive_failures = 0;
-
-        xSemaphoreTake(m_result_mutex, portMAX_DELAY);
-        m_result = result;
-        m_detector_ready = true;
-        xSemaphoreGive(m_result_mutex);
-    }
-
-    xEventGroupSetBits(m_event_group, TASK_STOPPED);
-    vTaskDelete(NULL);
-}
-
-void IntrusionMonitorTask::cleanup()
-{
-    if (m_gray_frame) {
-        heap_caps_free(m_gray_frame);
-        m_gray_frame = nullptr;
-    }
-
-    if (m_bootstrap_frames) {
-        for (size_t i = 0; i < kBootstrapFrames; ++i) {
-            if (m_bootstrap_frames[i]) {
-                heap_caps_free(m_bootstrap_frames[i]);
-            }
-        }
-        free(m_bootstrap_frames);
-        m_bootstrap_frames = nullptr;
-    }
-
-    intrusion_detector_deinit(&m_detector);
-    memset(&m_detector, 0, sizeof(m_detector));
-    m_pixels = 0;
-    m_bootstrap_count = 0;
-    m_detector_ready = false;
-    m_border_width = 0;
-
-    xSemaphoreTake(m_result_mutex, portMAX_DELAY);
-    memset(&m_result, 0, sizeof(m_result));
-    xSemaphoreGive(m_result_mutex);
-}
-
-bool IntrusionMonitorTask::init_detector_if_needed(who::cam::cam_fb_t *fb)
-{
-    if (m_gray_frame) {
-        return true;
-    }
-
-    (void)fb;
-    m_pixels = static_cast<size_t>(DETECT_WIDTH) * static_cast<size_t>(DETECT_HEIGHT);
-    m_gray_frame = static_cast<uint8_t *>(heap_caps_aligned_calloc(kImageBufferAlignment, 1, m_pixels, MALLOC_CAP_DEFAULT));
-    m_bootstrap_frames = static_cast<uint8_t **>(calloc(kBootstrapFrames, sizeof(uint8_t *)));
-    if (!m_gray_frame || !m_bootstrap_frames) {
-        ESP_LOGE(TAG, "gray frame allocation failed");
-        cleanup();
-        return false;
-    }
-
-    for (size_t i = 0; i < kBootstrapFrames; ++i) {
-        m_bootstrap_frames[i] =
-            static_cast<uint8_t *>(heap_caps_aligned_calloc(kImageBufferAlignment, 1, m_pixels, MALLOC_CAP_DEFAULT));
-        if (!m_bootstrap_frames[i]) {
-            ESP_LOGE(TAG, "bootstrap frame allocation failed");
-            cleanup();
-            return false;
-        }
-    }
-
-    intrusion_detector_default_config(&m_cfg, DETECT_WIDTH, DETECT_HEIGHT);
-    m_cfg.bg_method = ID_BG_KNN_STANDARD;
-    m_cfg.consecutive_trigger_frames = 3;
-    m_cfg.alarm_hold_frames = 10;
-    m_cfg.temporal_window = 2;
-    m_cfg.custom_border_enabled = m_custom_boundary_enabled;
-    m_cfg.custom_x1 = m_custom_x1;
-    m_cfg.custom_y1 = m_custom_y1;
-    m_cfg.custom_x2 = m_custom_x2;
-    m_cfg.custom_y2 = m_custom_y2;
-    m_border_width = calc_border_width(m_cfg);
-
-    if (!intrusion_detector_init(&m_detector, &m_cfg)) {
-        ESP_LOGE(TAG, "intrusion_detector_init failed");
-        cleanup();
-        return false;
-    }
-
-    return true;
-}
-
-bool IntrusionMonitorTask::convert_to_gray(who::cam::cam_fb_t *fb)
-{
-    if (!fb || !fb->buf || !m_gray_frame || fb->width == 0 || fb->height == 0) {
-        return false;
-    }
-
-    if (fb->format == who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB565) {
-        const uint16_t *src = static_cast<const uint16_t *>(fb->buf);
-        for (uint16_t y = 0; y < DETECT_HEIGHT; ++y) {
-            uint16_t sy = static_cast<uint16_t>((static_cast<uint32_t>(y) * fb->height) / DETECT_HEIGHT);
-            for (uint16_t x = 0; x < DETECT_WIDTH; ++x) {
-                uint16_t sx = static_cast<uint16_t>((static_cast<uint32_t>(x) * fb->width) / DETECT_WIDTH);
-                m_gray_frame[static_cast<size_t>(y) * DETECT_WIDTH + x] =
-                    rgb565_to_gray(src[static_cast<size_t>(sy) * fb->width + sx]);
-            }
-        }
-        return true;
-    }
-
-    if (fb->format == who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB888) {
-        const uint8_t *src = static_cast<const uint8_t *>(fb->buf);
-        for (uint16_t y = 0; y < DETECT_HEIGHT; ++y) {
-            uint16_t sy = static_cast<uint16_t>((static_cast<uint32_t>(y) * fb->height) / DETECT_HEIGHT);
-            for (uint16_t x = 0; x < DETECT_WIDTH; ++x) {
-                uint16_t sx = static_cast<uint16_t>((static_cast<uint32_t>(x) * fb->width) / DETECT_WIDTH);
-                const uint8_t *pixel = src + (static_cast<size_t>(sy) * fb->width + sx) * 3u;
-                m_gray_frame[static_cast<size_t>(y) * DETECT_WIDTH + x] =
-                    static_cast<uint8_t>((static_cast<uint16_t>(pixel[0]) * 77u +
-                                          static_cast<uint16_t>(pixel[1]) * 150u +
-                                          static_cast<uint16_t>(pixel[2]) * 29u) >>
-                                         8);
-            }
-        }
-        return true;
-    }
-
-    return false;
-}
-
-uint16_t IntrusionMonitorTask::calc_border_width(const intrusion_detector_config_t &cfg)
-{
-    uint16_t min_dim = cfg.width < cfg.height ? cfg.width : cfg.height;
-    uint16_t border_width = static_cast<uint16_t>(min_dim * cfg.border_width_ratio);
-    if (border_width < cfg.border_width_min_px) {
-        border_width = cfg.border_width_min_px;
-    }
-    if (border_width > min_dim / 2u) {
-        border_width = min_dim / 2u;
-    }
-    return border_width == 0u ? 1u : border_width;
-}
-
-HandDetectTask::HandDetectTask(const std::string &name, frame_cap::WhoFrameCapNode *frame_cap_node) :
-    task::WhoTask(name),
-    m_frame_cap_node(frame_cap_node),
-    m_detector(new HandDetect(HandDetect::ESPDET_PICO_224_224_HAND, true)),
-    m_result_mutex(xSemaphoreCreateMutex()),
-    m_result()
-{
-    m_result.ready = false;
-    frame_cap_node->add_new_frame_signal_subscriber(this);
-}
-
-HandDetectTask::~HandDetectTask()
-{
-    cleanup();
-    vSemaphoreDelete(m_result_mutex);
-    delete m_detector;
-}
-
-bool HandDetectTask::get_result(hand_detection_result_t *result)
-{
-    if (!result) {
-        return false;
-    }
-    xSemaphoreTake(m_result_mutex, portMAX_DELAY);
-    *result = m_result;
-    xSemaphoreGive(m_result_mutex);
-    return true;
-}
-
-void HandDetectTask::clear_result()
-{
-    xSemaphoreTake(m_result_mutex, portMAX_DELAY);
-    m_result.ready = false;
-    m_result.width = 0;
-    m_result.height = 0;
-    m_result.boxes.clear();
-    xSemaphoreGive(m_result_mutex);
-}
-
-void HandDetectTask::task()
-{
-    while (true) {
-        EventBits_t event_bits =
-            xEventGroupWaitBits(m_event_group, NEW_FRAME | TASK_PAUSE | TASK_STOP, pdTRUE, pdFALSE, portMAX_DELAY);
-        if (event_bits & TASK_STOP) {
-            break;
-        } else if (event_bits & TASK_PAUSE) {
-            xEventGroupSetBits(m_event_group, TASK_PAUSED);
-            EventBits_t pause_event_bits =
-                xEventGroupWaitBits(m_event_group, TASK_RESUME | TASK_STOP, pdTRUE, pdFALSE, portMAX_DELAY);
-            if (pause_event_bits & TASK_STOP) {
-                break;
-            }
-            continue;
-        }
-
-        auto fb = m_frame_cap_node->cam_fb_peek();
-        if (!fb || !fb->buf ||
-            (fb->format != who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB565 &&
-             fb->format != who::cam::cam_fb_fmt_t::CAM_FB_FMT_RGB888)) {
-            continue;
-        }
-
-        dl::image::img_t img = *fb;
-        std::list<dl::detect::result_t> &detect_results = m_detector->run(img);
-
-        hand_detection_result_t result = {};
-        result.ready = true;
-        result.width = fb->width;
-        result.height = fb->height;
-        for (const auto &box : detect_results) {
-            if (box.box.size() >= 4) {
-                result.boxes.push_back(box);
-            }
-        }
-
-        xSemaphoreTake(m_result_mutex, portMAX_DELAY);
-        m_result = result;
-        xSemaphoreGive(m_result_mutex);
-    }
-
-    xEventGroupSetBits(m_event_group, TASK_STOPPED);
-    vTaskDelete(NULL);
-}
-
-void HandDetectTask::cleanup()
-{
-    clear_result();
-}
 
 BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) :
     m_frame_cap(frame_cap),
@@ -589,29 +113,9 @@ BoundaryMonitorAppLCD::BoundaryMonitorAppLCD(frame_cap::WhoFrameCap *frame_cap) 
 
 #if !BSP_CONFIG_NO_GRAPHIC_LIB
     bsp_display_lock(0);
-    m_label = create_lvgl_label("Waiting: press Start Detect", LV_FONT_DEFAULT, {255, 255, 255});
-    lv_obj_align(m_label, LV_ALIGN_TOP_LEFT, 8, 8);
-
-    m_control_panel = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(m_control_panel, 180, 276);
-    lv_obj_align(m_control_panel, LV_ALIGN_TOP_RIGHT, -8, 8);
-    lv_obj_set_style_pad_all(m_control_panel, 8, 0);
-    lv_obj_set_style_bg_opa(m_control_panel, LV_OPA_70, 0);
-    lv_obj_set_style_bg_color(m_control_panel, lv_color_hex(0x1E242B), 0);
-
-    lv_obj_t *title = lv_label_create(m_control_panel);
-    lv_label_set_text(title, "Control Panel");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
-
-    lv_obj_t *button_col = lv_obj_create(m_control_panel);
-    lv_obj_set_size(button_col, LV_PCT(100), 224);
-    lv_obj_align(button_col, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_pad_all(button_col, 0, 0);
-    lv_obj_set_style_border_width(button_col, 0, 0);
-    lv_obj_set_style_bg_opa(button_col, LV_OPA_TRANSP, 0);
-    lv_obj_set_flex_flow(button_col, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(button_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(button_col, 6, 0);
+    m_label = create_status_label("Waiting: press Start Detect");
+    m_control_panel = create_control_panel();
+    lv_obj_t *button_col = create_button_column(m_control_panel);
 
     m_combined_btn =
         create_action_button(button_col, "Dual Detect", BoundaryMonitorAppLCD::combined_button_event_cb, this);
@@ -737,7 +241,10 @@ void BoundaryMonitorAppLCD::lcd_disp_cb(who::cam::cam_fb_t *fb)
                               hand_boundary_alarm ? "hand " : "",
                               static_cast<unsigned>(hand_result.boxes.size()));
     } else if (m_detection_enabled && !ready) {
-        lv_label_set_text_fmt(m_label, "Calibrating %u/%u", static_cast<unsigned>(bootstrap_count), kBootstrapFrames);
+        lv_label_set_text_fmt(m_label,
+                              "Calibrating %u/%u",
+                              static_cast<unsigned>(bootstrap_count),
+                              static_cast<unsigned>(IntrusionMonitorTask::BOOTSTRAP_FRAMES));
     } else {
         lv_label_set_text_fmt(
             m_label,
@@ -839,11 +346,8 @@ void BoundaryMonitorAppLCD::ensure_preview_layout(who::cam::cam_fb_t *fb)
         return;
     }
 
-    lv_obj_t *canvas = m_lcd_disp->get_canvas();
-    lv_obj_set_size(canvas, m_preview_w, m_preview_h);
-    lv_obj_align(canvas, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(canvas, BoundaryMonitorAppLCD::preview_click_event_cb, LV_EVENT_CLICKED, this);
+    configure_preview_canvas(
+        m_lcd_disp->get_canvas(), m_preview_w, m_preview_h, BoundaryMonitorAppLCD::preview_click_event_cb, this);
 
     m_preview_ready = true;
 #endif
@@ -1064,10 +568,7 @@ void BoundaryMonitorAppLCD::update_combined_button_text()
     if (!m_combined_btn) {
         return;
     }
-    lv_obj_t *label = lv_obj_get_child(m_combined_btn, 0);
-    if (label) {
-        lv_label_set_text(label, m_combined_detection_enabled ? "Stop Dual Detect" : "Dual Detect");
-    }
+    set_button_text(m_combined_btn, m_combined_detection_enabled ? "Stop Dual Detect" : "Dual Detect");
 #endif
 }
 
@@ -1077,10 +578,7 @@ void BoundaryMonitorAppLCD::update_start_button_text()
     if (!m_start_btn) {
         return;
     }
-    lv_obj_t *label = lv_obj_get_child(m_start_btn, 0);
-    if (label) {
-        lv_label_set_text(label, m_detection_enabled ? "Pause Detect" : "Start Detect");
-    }
+    set_button_text(m_start_btn, m_detection_enabled ? "Pause Detect" : "Start Detect");
 #endif
 }
 
@@ -1090,10 +588,7 @@ void BoundaryMonitorAppLCD::update_feature3_button_text()
     if (!m_placeholder_btn_2) {
         return;
     }
-    lv_obj_t *label = lv_obj_get_child(m_placeholder_btn_2, 0);
-    if (label) {
-        lv_label_set_text(label, m_hand_detection_enabled ? "Stop Hand Detect" : "Feature 3: Hand");
-    }
+    set_button_text(m_placeholder_btn_2, m_hand_detection_enabled ? "Stop Hand Detect" : "Feature 3: Hand");
 #endif
 }
 
@@ -1178,7 +673,7 @@ void BoundaryMonitorAppLCD::draw_hand_boxes(who::cam::cam_fb_t *fb, const hand_d
             img.pix_type == dl::image::DL_IMAGE_PIX_TYPE_RGB565LE ? kRgb565LeRed : kAlertColor;
         dl::image::draw_hollow_rectangle(img, x1, y1, x2, y2, color, 3);
 #else
-        draw_rect_on_canvas(m_lcd_disp->get_canvas(), x1, y1, x2, y2, get_lv_color(true), 3);
+        draw_rect_on_canvas(m_lcd_disp->get_canvas(), x1, y1, x2, y2, boundary_monitor_lv_color(true), 3);
 #endif
     }
 }
