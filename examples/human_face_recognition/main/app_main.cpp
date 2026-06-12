@@ -1,5 +1,5 @@
 #include "frame_cap_pipeline.hpp"
-#include "boundary_monitor_app.hpp"
+#include "lcd_show.hpp"
 #include "who_spiflash_fatfs.hpp"
 
 using namespace who::frame_cap;
